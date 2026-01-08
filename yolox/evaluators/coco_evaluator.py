@@ -16,7 +16,7 @@ import numpy as np
 
 import torch
 
-from yolox.data.datasets import COCO_CLASSES
+from yolox.data.datasets import BBOX_CLASSES, KEYPOINT_CLASSES
 from yolox.utils import (
     gather,
     is_main_process,
@@ -27,7 +27,7 @@ from yolox.utils import (
 )
 
 
-def per_class_AR_table(coco_eval, class_names=COCO_CLASSES, headers=["class", "AR"], colums=6):
+def per_class_AR_table(coco_eval, class_names=BBOX_CLASSES, headers=["class", "AR"], colums=6):
     per_class_AR = {}
     recalls = coco_eval.eval["recall"]
     # dimension of recalls: [TxKxAxM]
@@ -50,7 +50,7 @@ def per_class_AR_table(coco_eval, class_names=COCO_CLASSES, headers=["class", "A
     return table
 
 
-def per_class_AP_table(coco_eval, class_names=COCO_CLASSES, headers=["class", "AP"], colums=6):
+def per_class_AP_table(coco_eval, class_names=BBOX_CLASSES, headers=["class", "AP"], colums=6):
     per_class_AP = {}
     precisions = coco_eval.eval["precision"]
     # dimension of precisions: [TxRxKxAxM]
@@ -73,6 +73,93 @@ def per_class_AP_table(coco_eval, class_names=COCO_CLASSES, headers=["class", "A
         row_pair, tablefmt="pipe", floatfmt=".3f", headers=table_headers, numalign="left",
     )
     return table
+
+def per_class_kp_AR_table(coco_eval, all_class_names, keypoint_class_map=KEYPOINT_CLASSES, 
+                          headers=["class", "KP_AR"], colums=6):
+    """
+    计算keypoint的按类别AR并生成表格（区分有无关键点的类别）
+    Args:
+        coco_eval: COCOEval关键点评估对象
+        all_class_names: 所有BBOX类别名称列表
+        keypoint_class_map: 关键点类别配置（key=类别名，value=关键点列表）
+        headers: 表格表头
+        colums: 表格列数
+    """
+    per_class_AR = {}
+    recalls = coco_eval.eval["recall"]
+    # keypoint的recall维度: [TxKxAxM] (OKS, cls, area range, max dets)
+    assert len(all_class_names) == recalls.shape[1], "类别数量与recall维度不匹配"
+
+    # 先获取有关键点的类别集合
+    kp_class_set = set(keypoint_class_map.keys())
+    
+    for idx, class_name in enumerate(all_class_names):
+        # 仅对有关键点的类别计算AR，无关键点的直接标为nan
+        if class_name not in kp_class_set:
+            per_class_AR[class_name] = float("nan")
+            continue
+        
+        recall = recalls[:, idx, 0, -1]
+        recall = recall[recall > -1]
+        ar = np.mean(recall) if recall.size else float("nan")
+        per_class_AR[class_name] = float(ar * 100)
+
+    # 表格生成逻辑（保持和bbox一致）
+    num_cols = min(colums, len(per_class_AR) * len(headers))
+    result_pair = [x for pair in per_class_AR.items() for x in pair]
+    row_pair = itertools.zip_longest(*[result_pair[i::num_cols] for i in range(num_cols)])
+    table_headers = headers * (num_cols // len(headers))
+    # 修改floatfmt，让nan显示为/
+    table = tabulate(
+        row_pair, tablefmt="pipe", floatfmt=".3f", headers=table_headers, numalign="left",
+        missingval="/"  # 关键：无关键点的类别显示为/
+    )
+    return table
+
+
+def per_class_kp_AP_table(coco_eval, all_class_names, keypoint_class_map=KEYPOINT_CLASSES, 
+                          headers=["class", "KP_AP"], colums=6):
+    """
+    计算keypoint的按类别AP并生成表格（区分有无关键点的类别）
+    Args:
+        coco_eval: COCOEval关键点评估对象
+        all_class_names: 所有BBOX类别名称列表
+        keypoint_class_map: 关键点类别配置（key=类别名，value=关键点列表）
+        headers: 表格表头
+        colums: 表格列数
+    """
+    per_class_AP = {}
+    precisions = coco_eval.eval["precision"]    # (10, 101, 5, 3, 1)
+    # keypoint的precision维度: [TxRxKxAxM] (OKS, recall, cls, area range, max dets)
+    assert len(all_class_names) == precisions.shape[2], "类别数量与precision维度不匹配"
+
+    # 先获取有关键点的类别集合
+    kp_class_set = set(keypoint_class_map.keys())
+    
+    for idx, class_name in enumerate(all_class_names):
+        # 仅对有关键点的类别计算AP，无关键点的直接标为nan
+        if class_name not in kp_class_set:
+            per_class_AP[class_name] = float("nan")
+            continue
+        
+        precision = precisions[:, :, idx, 0, -1]    # (10, 101)
+        precision = precision[precision > -1]       # (1010,)
+        ap = np.mean(precision) if precision.size else float("nan")
+        per_class_AP[class_name] = float(ap * 100)
+
+    # 表格生成逻辑（保持和bbox一致）
+    num_cols = min(colums, len(per_class_AP) * len(headers))
+    result_pair = [x for pair in per_class_AP.items() for x in pair]
+    row_pair = itertools.zip_longest(*[result_pair[i::num_cols] for i in range(num_cols)])
+    table_headers = headers * (num_cols // len(headers))
+    # 修改floatfmt，让nan显示为/
+    table = tabulate(
+        row_pair, tablefmt="pipe", floatfmt=".3f", headers=table_headers, numalign="left",
+        missingval="/"  # 关键：无关键点的类别显示为/
+    )
+    return table
+
+
 
 
 class COCOEvaluator:
@@ -346,6 +433,24 @@ class COCOEvaluator:
             if self.per_class_AR:
                 AR_table = per_class_AR_table(cocoEval_bbox, class_names=cat_names)
                 info += "BBOX per class AR:\n" + AR_table + "\n"
+
+            # KEYPOINT 按类别AP/AR（新增：传入所有类别+关键点配置，自动区分）
+            if self.per_class_AP:
+                # 传入所有BBOX类别 + 关键点配置，函数内部自动筛选
+                kp_AP_table = per_class_kp_AP_table(
+                    coco_eval=cocoEval_kp,
+                    all_class_names=cat_names,
+                    keypoint_class_map=KEYPOINT_CLASSES
+                )
+                info += "Keypoint per class AP (/=无关键点):\n" + kp_AP_table + "\n"
+            if self.per_class_AR:
+                kp_AR_table = per_class_kp_AR_table(
+                    coco_eval=cocoEval_kp,
+                    all_class_names=cat_names,
+                    keypoint_class_map=KEYPOINT_CLASSES
+                )
+                info += "Keypoint per class AR (/=无关键点):\n" + kp_AR_table + "\n"
+
 
             # 返回bbox AP、关键点AP、完整日志
             return cocoEval_bbox.stats[0], cocoEval_kp.stats[0], info

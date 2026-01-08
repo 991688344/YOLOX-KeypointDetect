@@ -11,7 +11,7 @@ import megengine as mge
 import megengine.functional as F
 from loguru import logger
 
-from yolox.data.datasets import COCO_CLASSES
+from yolox.data.datasets import BBOX_CLASSES
 from yolox.utils import vis
 from yolox.data.data_augment import preproc as preprocess
 
@@ -96,7 +96,7 @@ class Predictor(object):
         confthre=0.01,
         nmsthre=0.65,
         test_size=(640, 640),
-        cls_names=COCO_CLASSES,
+        cls_names=BBOX_CLASSES,
         trt_file=None,
         decoder=None,
     ):
@@ -224,7 +224,7 @@ def main(args):
     model = build_and_load(args.ckpt, name=args.name)
     model.eval()
 
-    predictor = Predictor(model, confthre, nmsthre, test_size, COCO_CLASSES, None, None)
+    predictor = Predictor(model, confthre, nmsthre, test_size, BBOX_CLASSES, None, None)
     current_time = time.localtime()
     if args.demo == "image":
         image_demo(predictor, vis_folder, args.path, current_time, args.save_result)
