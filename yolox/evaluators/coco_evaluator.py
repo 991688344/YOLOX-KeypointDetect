@@ -11,6 +11,7 @@ import time
 from loguru import logger
 from tabulate import tabulate
 from tqdm import tqdm
+from pycocotools import mask as maskUtils
 
 import numpy as np
 
@@ -25,6 +26,7 @@ from yolox.utils import (
     time_synchronized,
     xyxy2xywh
 )
+from typing import List, Dict, Tuple
 
 
 def per_class_AR_table(coco_eval, class_names=BBOX_CLASSES, headers=["class", "AR"], colums=6):
@@ -74,92 +76,236 @@ def per_class_AP_table(coco_eval, class_names=BBOX_CLASSES, headers=["class", "A
     )
     return table
 
-def per_class_kp_AR_table(coco_eval, all_class_names, keypoint_class_map=KEYPOINT_CLASSES, 
-                          headers=["class", "KP_AR"], colums=6):
+
+def get_gt_anns_by_class(cocoGt, class_name: str) -> List[Dict]:
+    """按类别获取标注数据"""
+    cat_id = [cat['id'] for cat in cocoGt.cats.values() if cat['name'] == class_name][0]
+    ann_ids = cocoGt.getAnnIds(catIds=[cat_id])
+    return cocoGt.loadAnns(ann_ids)
+
+def get_dt_anns_by_class(cocoDt, class_name: str, cocoGt) -> List[Dict]:
+    """按类别获取预测数据"""
+    cat_id = [cat['id'] for cat in cocoGt.cats.values() if cat['name'] == class_name][0]
+    ann_ids = [ann['id'] for ann in cocoDt.anns.values() if ann['category_id'] == cat_id]
+    return [cocoDt.anns[aid] for aid in ann_ids]
+
+def compute_oks(gt_kp: np.ndarray, pred_kp: np.ndarray, gt_area: float, sigma: float) -> float:
     """
-    计算keypoint的按类别AR并生成表格（区分有无关键点的类别）
+    计算单个关键点的OKS（Object Keypoint Similarity）
     Args:
-        coco_eval: COCOEval关键点评估对象
-        all_class_names: 所有BBOX类别名称列表
-        keypoint_class_map: 关键点类别配置（key=类别名，value=关键点列表）
+        gt_kp: 标注关键点坐标 [x, y, v]（v=可见性：0不可见，1可见，2标注但不可见）
+        pred_kp: 预测关键点坐标 [x, y, score]
+        gt_area: 标注框的面积
+        sigma: 该关键点的OKS方差
+    Returns:
+        oks: 单个关键点的OKS值（0~1）
+    """
+    # 过滤不可见的标注关键点（v=0）
+    if gt_kp[2] == 0:
+        return 0.0
+    
+    # 计算欧氏距离
+    dx = pred_kp[0] - gt_kp[0]
+    dy = pred_kp[1] - gt_kp[1]
+    dist_sq = dx * dx + dy * dy
+    
+    # OKS公式：exp(-dist_sq / (2 * sigma^2 * gt_area))
+    oks = np.exp(-dist_sq / (2 * (sigma **2) * gt_area + 1e-9))
+    return oks
+
+# 关键点OKS方差配置（与你的setKpParams对应，按KEYPOINT_CLASSES的顺序）
+KP_OKS_SIGMAS = {
+    "Person": [0.25, 0.25, 0.35, 0.35],  # head, neck, left_shoulder, right_shoulder
+    "Seatbelt": [0.25, 0.25],  # top, tail（可根据实际需求调整）
+}
+
+def per_keypoint_AP_table(cocoGt, cocoDt, keypoint_class_map=KEYPOINT_CLASSES, 
+                          oks_sigmas=KP_OKS_SIGMAS, headers=["class", "keypoint", "KP_AP"], colums=6):
+    """
+    计算每个类别下单个关键点的AP并生成表格
+    Args:
+        cocoGt: COCO标注对象
+        cocoDt: COCO预测对象
+        keypoint_class_map: 关键点类别配置
+        oks_sigmas: 每个关键点的OKS方差
         headers: 表格表头
         colums: 表格列数
+    Returns:
+        格式化的表格字符串
     """
-    per_class_AR = {}
-    recalls = coco_eval.eval["recall"]
-    # keypoint的recall维度: [TxKxAxM] (OKS, cls, area range, max dets)
-    assert len(all_class_names) == recalls.shape[1], "类别数量与recall维度不匹配"
-
-    # 先获取有关键点的类别集合
-    kp_class_set = set(keypoint_class_map.keys())
+    per_kp_AP = {}
     
-    for idx, class_name in enumerate(all_class_names):
-        # 仅对有关键点的类别计算AR，无关键点的直接标为nan
-        if class_name not in kp_class_set:
-            per_class_AR[class_name] = float("nan")
+    # 遍历所有有关键点的类别
+    for class_name, kp_names in keypoint_class_map.items():
+        # 获取该类别的标注和预测
+        gt_anns = get_gt_anns_by_class(cocoGt, class_name)
+        dt_anns = get_dt_anns_by_class(cocoDt, class_name, cocoGt)
+        if not gt_anns or not dt_anns:
+            for kp_name in kp_names:
+                per_kp_AP[(class_name, kp_name)] = float("nan")
             continue
         
-        recall = recalls[:, idx, 0, -1]
-        recall = recall[recall > -1]
-        ar = np.mean(recall) if recall.size else float("nan")
-        per_class_AR[class_name] = float(ar * 100)
-
-    # 表格生成逻辑（保持和bbox一致）
-    num_cols = min(colums, len(per_class_AR) * len(headers))
-    result_pair = [x for pair in per_class_AR.items() for x in pair]
-    row_pair = itertools.zip_longest(*[result_pair[i::num_cols] for i in range(num_cols)])
+        # 获取该类别的OKS方差
+        sigmas = oks_sigmas.get(class_name, [0.3]*len(kp_names))
+        
+        # 遍历该类别下的每个关键点
+        for kp_idx, kp_name in enumerate(kp_names):
+            sigma = sigmas[kp_idx]
+            oks_thresholds = np.linspace(0.5, 0.95, 10)  # COCO标准OKS阈值
+            
+            # 存储每个OKS阈值下的precision
+            all_precisions = []
+            
+            for oks_thr in oks_thresholds:
+                # 统计TP/FP/FN
+                tp = 0  # 真阳性
+                fp = 0  # 假阳性
+                fn = 0  # 假阴性
+                
+                # 标记已匹配的标注
+                gt_matched = [False] * len(gt_anns)
+                
+                # 遍历预测结果（按score降序）
+                dt_anns_sorted = sorted(dt_anns, key=lambda x: x['score'], reverse=True)
+                
+                for dt_ann in dt_anns_sorted:
+                    dt_kp = dt_ann['keypoints'][kp_idx*3 : (kp_idx+1)*3]  # 单个关键点 [x,y,score]
+                    if dt_kp[2] < 0.1:  # 预测置信度过低，跳过
+                        fp +=1
+                        continue
+                    
+                    # 寻找最佳匹配的标注
+                    best_oks = 0.0
+                    best_gt_idx = -1
+                    
+                    for gt_idx, gt_ann in enumerate(gt_anns):
+                        if gt_matched[gt_idx]:
+                            continue
+                        gt_kp = gt_ann['keypoints'][kp_idx*3 : (kp_idx+1)*3]  # [x,y,v]
+                        gt_area = gt_ann['area'] if 'area' in gt_ann else maskUtils.area(gt_ann['segmentation'])
+                        
+                        # 计算OKS
+                        oks = compute_oks(gt_kp, dt_kp, gt_area, sigma)
+                        if oks > best_oks and oks >= oks_thr:
+                            best_oks = oks
+                            best_gt_idx = gt_idx
+                    
+                    if best_gt_idx >= 0:
+                        tp +=1
+                        gt_matched[best_gt_idx] = True
+                    else:
+                        fp +=1
+                
+                # 计算FN（未匹配的标注）
+                fn = sum([not matched for matched in gt_matched])
+                
+                # 计算precision
+                if tp + fp == 0:
+                    precision = 0.0
+                else:
+                    precision = tp / (tp + fp)
+                all_precisions.append(precision)
+            
+            # 计算该关键点的AP（所有OKS阈值的平均precision）
+            all_precisions = np.array(all_precisions)
+            ap = np.mean(all_precisions) if all_precisions.size else float("nan")
+            per_kp_AP[(class_name, kp_name)] = float(ap * 100)
+    
+    # 格式化表格数据
+    result_list = []
+    for (class_name, kp_name), ap_value in per_kp_AP.items():
+        result_list.append(class_name)
+        result_list.append(kp_name)
+        result_list.append(ap_value)
+    
+    # 生成表格
+    num_cols = min(colums, len(result_list))
+    row_pair = itertools.zip_longest(*[result_list[i::num_cols] for i in range(num_cols)])
     table_headers = headers * (num_cols // len(headers))
-    # 修改floatfmt，让nan显示为/
     table = tabulate(
         row_pair, tablefmt="pipe", floatfmt=".3f", headers=table_headers, numalign="left",
-        missingval="/"  # 关键：无关键点的类别显示为/
+        missingval="N/A"
     )
     return table
 
-
-def per_class_kp_AP_table(coco_eval, all_class_names, keypoint_class_map=KEYPOINT_CLASSES, 
-                          headers=["class", "KP_AP"], colums=6):
+def per_keypoint_AR_table(cocoGt, cocoDt, keypoint_class_map=KEYPOINT_CLASSES, 
+                          oks_sigmas=KP_OKS_SIGMAS, headers=["class", "keypoint", "KP_AR"], colums=6):
     """
-    计算keypoint的按类别AP并生成表格（区分有无关键点的类别）
-    Args:
-        coco_eval: COCOEval关键点评估对象
-        all_class_names: 所有BBOX类别名称列表
-        keypoint_class_map: 关键点类别配置（key=类别名，value=关键点列表）
-        headers: 表格表头
-        colums: 表格列数
+    计算每个类别下单个关键点的AR并生成表格
+    逻辑与AP类似，AR是recall的平均值（recall = TP/(TP+FN)）
     """
-    per_class_AP = {}
-    precisions = coco_eval.eval["precision"]    # (10, 101, 5, 3, 1)
-    # keypoint的precision维度: [TxRxKxAxM] (OKS, recall, cls, area range, max dets)
-    assert len(all_class_names) == precisions.shape[2], "类别数量与precision维度不匹配"
-
-    # 先获取有关键点的类别集合
-    kp_class_set = set(keypoint_class_map.keys())
+    per_kp_AR = {}
     
-    for idx, class_name in enumerate(all_class_names):
-        # 仅对有关键点的类别计算AP，无关键点的直接标为nan
-        if class_name not in kp_class_set:
-            per_class_AP[class_name] = float("nan")
+    # 遍历所有有关键点的类别
+    for class_name, kp_names in keypoint_class_map.items():
+        gt_anns = get_gt_anns_by_class(cocoGt, class_name)
+        dt_anns = get_dt_anns_by_class(cocoDt, class_name, cocoGt)
+        if not gt_anns:
+            for kp_name in kp_names:
+                per_kp_AR[(class_name, kp_name)] = float("nan")
             continue
         
-        precision = precisions[:, :, idx, 0, -1]    # (10, 101)
-        precision = precision[precision > -1]       # (1010,)
-        ap = np.mean(precision) if precision.size else float("nan")
-        per_class_AP[class_name] = float(ap * 100)
-
-    # 表格生成逻辑（保持和bbox一致）
-    num_cols = min(colums, len(per_class_AP) * len(headers))
-    result_pair = [x for pair in per_class_AP.items() for x in pair]
-    row_pair = itertools.zip_longest(*[result_pair[i::num_cols] for i in range(num_cols)])
+        sigmas = oks_sigmas.get(class_name, [0.3]*len(kp_names))
+        
+        # 遍历该类别下的每个关键点
+        for kp_idx, kp_name in enumerate(kp_names):
+            sigma = sigmas[kp_idx]
+            oks_thresholds = np.linspace(0.5, 0.95, 10)
+            
+            all_recalls = []
+            for oks_thr in oks_thresholds:
+                tp = 0
+                fn = 0
+                gt_matched = [False] * len(gt_anns)
+                
+                # 遍历预测结果（取前100个，COCO标准）
+                dt_anns_sorted = sorted(dt_anns, key=lambda x: x['score'], reverse=True)[:100]
+                
+                for dt_ann in dt_anns_sorted:
+                    dt_kp = dt_ann['keypoints'][kp_idx*3 : (kp_idx+1)*3]
+                    if dt_kp[2] < 0.1:
+                        continue
+                    
+                    best_oks = 0.0
+                    best_gt_idx = -1
+                    for gt_idx, gt_ann in enumerate(gt_anns):
+                        if gt_matched[gt_idx]:
+                            continue
+                        gt_kp = gt_ann['keypoints'][kp_idx*3 : (kp_idx+1)*3]
+                        gt_area = gt_ann['area'] if 'area' in gt_ann else maskUtils.area(gt_ann['segmentation'])
+                        
+                        oks = compute_oks(gt_kp, dt_kp, gt_area, sigma)
+                        if oks > best_oks and oks >= oks_thr:
+                            best_oks = oks
+                            best_gt_idx = gt_idx
+                    
+                    if best_gt_idx >= 0:
+                        tp +=1
+                        gt_matched[best_gt_idx] = True
+                
+                fn = sum([not matched for matched in gt_matched])
+                recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+                all_recalls.append(recall)
+            
+            all_recalls = np.array(all_recalls)
+            ar = np.mean(all_recalls) if all_recalls.size else float("nan")
+            per_kp_AR[(class_name, kp_name)] = float(ar * 100)
+    
+    # 格式化表格
+    result_list = []
+    for (class_name, kp_name), ar_value in per_kp_AR.items():
+        result_list.append(class_name)
+        result_list.append(kp_name)
+        result_list.append(ar_value)
+    
+    num_cols = min(colums, len(result_list))
+    row_pair = itertools.zip_longest(*[result_list[i::num_cols] for i in range(num_cols)])
     table_headers = headers * (num_cols // len(headers))
-    # 修改floatfmt，让nan显示为/
     table = tabulate(
         row_pair, tablefmt="pipe", floatfmt=".3f", headers=table_headers, numalign="left",
-        missingval="/"  # 关键：无关键点的类别显示为/
+        missingval="N/A"
     )
     return table
-
-
 
 
 class COCOEvaluator:
@@ -291,7 +437,7 @@ class COCOEvaluator:
                     "input_w": self.img_size[1],
                 }
                 outputs = postprocess(
-                    outputs, letterbox_info, self.num_classes, self.confthre, self.nmsthre, keypoints=True
+                    outputs, letterbox_info, self.num_classes, self.confthre, self.nmsthre, class_agnostic=False, keypoints=True
                 )   # (N, 19) 5+1+1+12
                 if is_time_record:
                     nms_end = time_synchronized()
@@ -414,7 +560,7 @@ class COCOEvaluator:
             info += "="*50 + " Keypoints Evaluation " + "="*50 + "\n"
             cocoEval_kp = COCOeval(cocoGt, cocoDt, annType[2])  # keypoints
             # 定义4个关键点的oks方差
-            cocoEval_kp.setKpParams(kpt_oks_sigmas=[0.35, 0.35, 0.25, 0.25])
+            cocoEval_kp.setKpParams(kpt_oks_sigmas=KP_OKS_SIGMAS["Person"])
             # 关键点评估：自动使用OKS阈值，适配4个关键点的数据集
             cocoEval_kp.evaluate()
             cocoEval_kp.accumulate()
@@ -425,34 +571,37 @@ class COCOEvaluator:
             info += kp_info + "\n"
 
             # 类别级评估（可选）
+            info += "="*50 + " BBOX Evaluation (Per class) " + "="*50 + "\n"
             cat_ids = list(cocoGt.cats.keys())
             cat_names = [cocoGt.cats[catId]['name'] for catId in sorted(cat_ids)]
             if self.per_class_AP:
                 AP_table = per_class_AP_table(cocoEval_bbox, class_names=cat_names)
-                info += "BBOX per class AP:\n" + AP_table + "\n"
+                info += "BBOX per class AP:\n" + AP_table + "\n\n"
             if self.per_class_AR:
                 AR_table = per_class_AR_table(cocoEval_bbox, class_names=cat_names)
                 info += "BBOX per class AR:\n" + AR_table + "\n"
 
-            # KEYPOINT 按类别AP/AR（新增：传入所有类别+关键点配置，自动区分）
+            # 4. 单个关键点的AP/AR（新增核心功能）
+            info += "="*50 + " Keypoints Evaluation (Per Keypoint) " + "="*50 + "\n"
             if self.per_class_AP:
-                # 传入所有BBOX类别 + 关键点配置，函数内部自动筛选
-                kp_AP_table = per_class_kp_AP_table(
-                    coco_eval=cocoEval_kp,
-                    all_class_names=cat_names,
-                    keypoint_class_map=KEYPOINT_CLASSES
+                kp_AP_table = per_keypoint_AP_table(
+                    cocoGt=cocoGt,
+                    cocoDt=cocoDt,
+                    keypoint_class_map=KEYPOINT_CLASSES,
+                    oks_sigmas= KP_OKS_SIGMAS
                 )
-                info += "Keypoint per class AP (/=无关键点):\n" + kp_AP_table + "\n"
+                info += "Keypoint per (class, keypoint) AP:\n" + kp_AP_table + "\n\n"
+            
             if self.per_class_AR:
-                kp_AR_table = per_class_kp_AR_table(
-                    coco_eval=cocoEval_kp,
-                    all_class_names=cat_names,
-                    keypoint_class_map=KEYPOINT_CLASSES
+                kp_AR_table = per_keypoint_AR_table(
+                    cocoGt=cocoGt,
+                    cocoDt=cocoDt,
+                    keypoint_class_map=KEYPOINT_CLASSES,
+                    oks_sigmas= KP_OKS_SIGMAS
                 )
-                info += "Keypoint per class AR (/=无关键点):\n" + kp_AR_table + "\n"
-
+            info += "Keypoint per (class, keypoint) AR:\n" + kp_AR_table + "\n"
 
             # 返回bbox AP、关键点AP、完整日志
-            return cocoEval_bbox.stats[0], cocoEval_kp.stats[0], info
+            return cocoEval_bbox.stats[0],cocoEval_bbox.stats[1], cocoEval_kp.stats[0], cocoEval_kp.stats[1], info
         else:
-            return 0, 0, info
+            return 0, 0 ,0, 0, info

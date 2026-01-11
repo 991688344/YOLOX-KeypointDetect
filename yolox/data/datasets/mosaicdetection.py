@@ -133,13 +133,13 @@ class MosaicDetection(Dataset):
                     labels[:, 3] = scale * _labels[:, 3] + padh
 
                     if self.keypoints > 0:
-                        for kpn in range(5, 5+self.keypoints*2, 2):
+                        for kpn in range(5, 5+self.keypoints*3, 3):     ######### keypoints adjust
                             labels[:, kpn] = np.array(_labels[:, kpn] > 0, dtype=np.int32) * \
                                              (scale * _labels[:, kpn] + padw) + \
-                                             (np.array(_labels[:, kpn] > 0, dtype=np.int32) - 1)
+                                             (np.array(_labels[:, kpn] > 0, dtype=np.int32)- 1)        ### 
                             labels[:, kpn+1] = np.array(_labels[:, kpn+1] > 0, dtype=np.int32) * \
                                                (scale * _labels[:, kpn+1] + padh) + \
-                                               (np.array(_labels[:, kpn+1] > 0, dtype=np.int32) - 1)
+                                               (np.array(_labels[:, kpn+1] > 0, dtype=np.int32)- 1)    #### 
 
                 mosaic_labels.append(labels)
 
@@ -159,20 +159,22 @@ class MosaicDetection(Dataset):
                 perspective=self.perspective,
                 border=[-input_h // 2, -input_w // 2],
                 keypoints=self.keypoints,
+                kp_dim=3,             # 每个关键点的维度 (x,y,v)
                 segcls=self.segcls,
                 seg=mosaic_seg
             )  # border to remove
 
             if len(mosaic_labels) and self.keypoints > 0:
-                landmarks = mosaic_labels[:, -2*self.keypoints:]
+                landmarks = mosaic_labels[:, -3*self.keypoints:]    #####
                 for j, kps in enumerate(landmarks):
-                    kps = kps.reshape(-1, 2)
+                    kps = kps.reshape(-1, 3)
                     for k, point in enumerate(kps):
-                        x, y = point
+                        x, y, v = point
                         if x < 0 or y < 0 or x > 2 * input_w or y > 2 * input_h:
-                            landmarks[j][2 * k] = -1
-                            landmarks[j][2 * k + 1] = -1
-                mosaic_labels[:, -2*self.keypoints:] = landmarks
+                            landmarks[j][3 * k] = -1
+                            landmarks[j][3 * k + 1] = -1
+                            landmarks[j][3 * k + 2] = 0
+                mosaic_labels[:, -3*self.keypoints:] = landmarks
 
             if (self.enable_mixup and not len(mosaic_labels) == 0 and random.random() < self.mixup_prob) and self.segcls==0:
                 mosaic_img, mosaic_labels = self.mixup(mosaic_img, mosaic_labels, self.input_dim)

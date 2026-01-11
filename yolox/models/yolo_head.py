@@ -30,7 +30,7 @@ class YOLOXHead(nn.Module):
             model_export=False,
             repeat=2,
             decode_in_inference = False,
-            kps_sigmas = [0.026, 0.035, 0.079, 0.079]
+            kps_sigmas = [0.25, 0.25, 0.35, 0.35]
     ):
         """
         Args:
@@ -911,10 +911,9 @@ class YOLOXHead(nn.Module):
         # OKS based loss
         d = (kpts_preds_x - kpts_targets_x) ** 2 + (kpts_preds_y - kpts_targets_y) ** 2         # d = (Δx² + Δy²) [N,4]
         bbox_scale = torch.prod(bbox_targets[:, -2:], dim=1, keepdim=True)  # scale derived from bbox gt 
-        oks = torch.exp(-d / (2 * bbox_scale * (sigmas** 2) + 1e-9))
-        lkpt = ((1 - oks) * kpt_targets_vis_mask).sum(axis=1) / (kpt_targets_vis_mask.sum(axis=1) + 1e-9)           # 乘上 mask（只有存在的关键点才算损失）
-
-        # oks = torch.exp(-d / (2 * (bbox_scale * sigmas / 10.0) ** 2 + 1e-9))
-        # lkpt = kpt_loss_factor * ((1 - oks) * kpt_targets_vis_mask).mean()
+        oks = torch.exp(-d / (bbox_scale * (4 * sigmas) + 1e-9))
+        # lkpt = ((1 - oks) * kpt_targets_vis_mask).sum(axis=1) / (kpt_targets_vis_mask.sum(axis=1) + 1e-9)           # 乘上 mask（只有存在的关键点才算损失）
+        kpt_loss_factor = (torch.sum(kpt_targets_vis_mask != 0) + torch.sum(kpt_targets_vis_mask == 0)) / torch.sum(kpt_targets_vis_mask != 0)
+        lkpt = kpt_loss_factor * ((1 - oks**2) * kpt_targets_vis_mask).mean(axis=1)          # 乘上 mask（只有存在的关键点才算损失）
 
         return lkpt, lkptv

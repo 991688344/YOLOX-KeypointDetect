@@ -59,6 +59,7 @@ def random_perspective(
         perspective=0.0,
         border=(0, 0),
         keypoints=0,
+        kp_dim=3,             # 每个关键点的维度 (x,y,v)
         segcls=0,
         seg=np.array([])
 ):
@@ -144,21 +145,58 @@ def random_perspective(
         targets = targets[ind]
         targets[:, :4] = xy[ind]
         m = len(targets)
+        # 适配keypoints从4*2 → 4*3 (坐标+可见性)
         if keypoints > 0 and m > 0:
-            landmarks = np.ones((m * keypoints, 3))
-            landmarks[:, :2] = targets[:, -2 * keypoints:].reshape(m * keypoints, 2)
-            mask_landmarks = [np.array(x > 0, dtype=np.int32) for x in landmarks]
-            landmarks = landmarks @ M.T  # transform
-            landmarks = np.array([x * y + y - 1 for x, y in zip(landmarks, mask_landmarks)])
+            # 1. 提取keypoints部分 (最后3*keypoints列)
+            kpts = targets[:, -3 * keypoints:]  # 原代码是-2*keypoints，改为3倍
+            # 2. 拆分坐标(x,y)和可见性(vis)：reshape为(m, keypoints, 3)
+            kpts_reshaped = kpts.reshape(m, keypoints, 3)
+            kpts_xy = kpts_reshaped[..., :2]  # 坐标部分 (m, keypoints, 2)
+            kpts_vis = kpts_reshaped[..., 2:]  # 可见性部分 (m, keypoints, 1) → 不参与任何变换
+            
+            # 3. 处理坐标变换（仅对x,y）
+            landmarks_xy = kpts_xy.reshape(m * keypoints, 2)  # 展平为(m*keypoints, 2)
+            landmarks = np.ones((m * keypoints, 3))  # 构造齐次坐标
+            landmarks[:, :2] = landmarks_xy
+            
+            # 4. 掩码处理（仅针对坐标，过滤无效点）
+            mask_landmarks = (landmarks[:, :2] > 0).astype(np.int32)  # 向量化处理，替代原列表推导式
+            landmarks = landmarks @ M.T  # 应用变换矩阵
+            
+            # 5. 掩码修正（保持原逻辑）
+            landmarks[:, :2] = landmarks[:, :2] * mask_landmarks + mask_landmarks - 1
 
-            if perspective:  # False
-                mask_landmarks = np.array([np.array(x != -1, dtype=np.int32) for x in landmarks[:, :2]]).reshape(m,
-                                                                                                                 2 * keypoints)
-                landmarks = (landmarks[:, :2] / landmarks[:, 2:3]).reshape(m, 2 * keypoints)  # rescale
-                landmarks = np.array([x * y + y - 1 for x, y in zip(landmarks, mask_landmarks)])
-            else:  # affine
-                landmarks = landmarks[:, :2].reshape(m, 2 * keypoints)
-            targets[:, -2 * keypoints:] = landmarks
+            if perspective:  # 透视变换
+                # 归一化坐标
+                landmarks[:, :2] = landmarks[:, :2] / landmarks[:, 2:3]
+                # 重新生成掩码
+                mask_landmarks = (landmarks[:, :2] != -1).astype(np.int32)
+                landmarks[:, :2] = landmarks[:, :2] * mask_landmarks + mask_landmarks - 1
+                # 重塑为(m, keypoints, 2)
+                transformed_xy = landmarks[:, :2].reshape(m, keypoints, 2)
+            else:  # 仿射变换（主流场景）
+                # 直接取前两列，重塑为(m, keypoints, 2)
+                transformed_xy = landmarks[:, :2].reshape(m, keypoints, 2)
+
+            # 6. 合并变换后的坐标 + 原始可见性（核心：可见性不变）
+            transformed_kpts = np.concatenate([transformed_xy, kpts_vis], axis=-1)
+            # 7. 重塑并赋值回targets
+            targets[:, -3 * keypoints:] = transformed_kpts.reshape(m, 3 * keypoints)
+        # if keypoints > 0 and m > 0:
+        #     landmarks = np.ones((m * keypoints, 3))
+        #     landmarks[:, :2] = targets[:, -2 * keypoints:].reshape(m * keypoints, 2)
+        #     mask_landmarks = [np.array(x > 0, dtype=np.int32) for x in landmarks]
+        #     landmarks = landmarks @ M.T  # transform
+        #     landmarks = np.array([x * y + y - 1 for x, y in zip(landmarks, mask_landmarks)])
+
+        #     if perspective:  # False
+        #         mask_landmarks = np.array([np.array(x != -1, dtype=np.int32) for x in landmarks[:, :2]]).reshape(m,
+        #                                                                                                          2 * keypoints)
+        #         landmarks = (landmarks[:, :2] / landmarks[:, 2:3]).reshape(m, 2 * keypoints)  # rescale
+        #         landmarks = np.array([x * y + y - 1 for x, y in zip(landmarks, mask_landmarks)])
+        #     else:  # affine
+        #         landmarks = landmarks[:, :2].reshape(m, 2 * keypoints)
+        #     targets[:, -2 * keypoints:] = landmarks
     return img, targets, seg
 
 
@@ -254,7 +292,7 @@ class TrainTransform:
         if len(boxes) == 0:
             targets = np.zeros((self.max_labels, 5 + 3 * self.keypoints), dtype=np.float32)
             if self.keypoints > 0:
-                targets[..., -3 * self.keypoints:] = targets[..., -3 * self.keypoints:] - 1
+                targets[..., -3 * self.keypoints:] = targets[..., -3 * self.keypoints:] * 0####- 1
             if self.segcls > 0:
                 seg_targets = seg_targets * 0
             else:

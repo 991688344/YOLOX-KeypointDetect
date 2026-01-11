@@ -88,15 +88,15 @@ class Exp(MyExp):
 
         self.weight_decay = 5e-4
         self.momentum = 0.9
-        self.print_interval = 1
-        self.eval_interval = 1
+        self.print_interval = 10
+        self.eval_interval = 10
         self.save_history_ckpt = False
         self.exp_name = os.path.split(os.path.realpath(__file__))[1].split(".")[0]
 
         # -----------------  testing config ------------------ #
         self.test_size = (384, 640)
         self.test_conf = 0.7
-        self.nmsthre = 0.65
+        self.nmsthre = 0.30
         self.model_export = False
         self.output_dir = f'./YOLOX_outputs/'
 
@@ -126,11 +126,13 @@ class Exp(MyExp):
             else:
                 backbone = YOLOPAFPN(self.img_channel, self.depth, self.width, in_channels=self.in_channels,
                                      in_features=self.in_features, act=self.act,
+                                     depthwise=False,
                                      input_size=self.input_size)
 
             head = YOLOXHead(self.num_classes, self.width, in_channels=self.in_channels, act=self.act,
                              keypoints=self.keypoints, segcls=self.segcls, model_export=self.model_export,
                              repeat=self.repeat,
+                             depthwise=False,
                              decode_in_inference = self.decode_in_inference)
             self.model = YOLOX(backbone, head)
 

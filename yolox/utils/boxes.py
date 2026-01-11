@@ -32,7 +32,7 @@ def filter_box(output, scale_range):
     return output[keep]
 
 
-def postprocess(prediction, letterbox_info, num_classes, conf_thre=0.7, nms_thre=0.45,
+def postprocess(prediction, letterbox_info, num_classes, conf_thre=0.7, nms_thre=0.7,
                 class_agnostic=False, keypoints=False, segs=False):
     """
     适配Letterbox预处理的后处理函数

@@ -62,6 +62,7 @@ class Trainer:
         self.data_type = torch.float16 if args.fp16 else torch.float32
         self.input_size = exp.input_size
         self.best_ap = 0
+        self.kp_best_ap = 0
 
         # metric record
         self.meter = MeterBuffer(window_size=exp.print_interval)
@@ -374,17 +375,20 @@ class Trainer:
                 evalmodel = evalmodel.module
 
         with adjust_status(evalmodel, training=False):
-            (ap50_95, ap50, summary) = self.exp.eval(
+            (ap50_95, ap50, kp_ap50_95, kp_ap50, summary) = self.exp.eval(
                 evalmodel, self.evaluator, self.is_distributed
             )
 
-        update_best_ckpt = ap50_95 > self.best_ap
+        update_best_ckpt = ap50_95 > self.best_ap or kp_ap50_95 > self.kp_best_ap
         self.best_ap = max(self.best_ap, ap50_95)
-        
+        self.kp_best_ap = max(self.kp_best_ap, kp_ap50_95)
+
         if self.rank == 0:
             if self.args.logger == "tensorboard":
                 self.tblogger.add_scalar("val/COCOAP50", ap50, self.epoch + 1)
                 self.tblogger.add_scalar("val/COCOAP50_95", ap50_95, self.epoch + 1)
+                self.tblogger.add_scalar("val/KPAP50", kp_ap50, self.epoch + 1)
+                self.tblogger.add_scalar("val/KPAP50_95", kp_ap50_95, self.epoch + 1)
                 try:
                     if "per class AP:" in summary:
                         ap_section = summary.split("per class AP:", 1)[1]
@@ -418,11 +422,11 @@ class Trainer:
         #     logger.info("\n" + summary)
         # synchronize()
         # update_best_ckpt, ap50_95 = False, None
-        self.save_ckpt("last_epoch", update_best_ckpt, ap=ap50_95)
+        self.save_ckpt("last_epoch", update_best_ckpt, ap=ap50_95, kp_ap50_95=kp_ap50_95)
         if self.save_history_ckpt:
-            self.save_ckpt(f"epoch_{self.epoch + 1}", ap=ap50_95)
+            self.save_ckpt(f"epoch_{self.epoch + 1}", ap=ap50_95, kp_ap50_95=kp_ap50_95)
 
-    def save_ckpt(self, ckpt_name, update_best_ckpt=False, ap=None):
+    def save_ckpt(self, ckpt_name, update_best_ckpt=False, ap=None, kp_ap50_95=None):
         if self.rank == 0:
             save_model = self.ema_model.ema if self.use_model_ema else self.model
             logger.info("Save weights to {}".format(self.file_name))
@@ -431,7 +435,9 @@ class Trainer:
                 "model": save_model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
                 "best_ap": self.best_ap,
+                "kp_best_ap": self.kp_best_ap,
                 "curr_ap": ap,
+                "curr_kp_ap": kp_ap50_95
             }
             save_checkpoint(
                 ckpt_state,
@@ -449,7 +455,8 @@ class Trainer:
                         "epoch": self.epoch + 1,
                         "optimizer": self.optimizer.state_dict(),
                         "best_ap": self.best_ap,
-                        "curr_ap": ap
+                        "curr_ap": ap,
+                        "curr_kp_ap": kp_ap50_95
                     }
                 )
         
@@ -474,7 +481,7 @@ class Trainer:
         # ===================== 1. 数据预处理：确保兼容OpenCV =====================
         # 1.1 张量转numpy（解耦+CPU）
         img_np = img_tensor.detach().cpu().numpy()  # [3, 384, 640]
-        target_np = target_tensor.detach().cpu().numpy()  # [120, 13]
+        target_np = target_tensor.detach().cpu().numpy()  # [120, 17] 5+12
         
         # 1.2 CHW转HWC + 还原归一化 + 限制范围 + 转uint8
         img_np = img_np.transpose(1, 2, 0)  # [H, W, 3]
@@ -506,7 +513,7 @@ class Trainer:
             # 3.1 解析标签
             cls_id = int(target[0])
             bbox = target[1:5]
-            keypoints = target[5:13]
+            keypoints = target[5:17]
 
             # 3.2 解析bbox
             if bbox_format == "xyxy":
@@ -536,8 +543,8 @@ class Trainer:
             cv2.putText(img_np, text, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
 
             # 3.6 绘制关键点
-            kps = keypoints.reshape(-1, 2)
-            for kp_idx, (kx, ky) in enumerate(kps):
+            kps = keypoints.reshape(-1, 3)
+            for kp_idx, (kx, ky, vis) in enumerate(kps):
                 if kx <= 0 or ky <= 0 or kx >= W or ky >= H:
                     continue
                 kx, ky = int(kx), int(ky)

@@ -6,6 +6,7 @@ import argparse
 import os
 import time
 from loguru import logger
+from tqdm import tqdm  # 导入tqdm库
 
 import cv2
 import os
@@ -215,9 +216,9 @@ class Predictor(object):
             }
             outputs = postprocess(
                 outputs[0], letterbox_info, self.num_classes, self.confthre,
-                self.nmsthre, class_agnostic=True, keypoints=self.keypoints, segs=self.segs
+                self.nmsthre, class_agnostic=False, keypoints=self.keypoints, segs=self.segs
             )
-            logger.info("Infer time: {:.4f}s".format(time.time() - t0))
+            # logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, seg_output, img_info
 
     def visual(self, output, seg_output, img_info, cls_conf=0.35, draw_kp=False, draw_seg=False):
@@ -395,35 +396,67 @@ def image_demo(predictor, vis_folder, path, current_time, save_result, draw_kp, 
 
 
 def imageflow_demo(predictor, vis_folder, current_time, args):
-    cap = cv2.VideoCapture(args.path if args.demo == "video" else args.camid)
-    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)  # float
-    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)  # float
+    # 1. 打开视频文件（仅保留视频处理，移除摄像头逻辑）
+    cap = cv2.VideoCapture(args.path)
+    if not cap.isOpened():
+        logger.error(f"无法打开视频文件: {args.path}")
+        return
+    
+    # 2. 获取视频基础信息（仅针对视频文件）
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))  # 视频总帧数
+    
+    # 3. 初始化视频保存（仅保存视频文件处理结果）
+    vid_writer = None
     if args.save_result:
         save_folder = os.path.join(
             vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
         )
         os.makedirs(save_folder, exist_ok=True)
-        if args.demo == "video":
-            save_path = os.path.join(save_folder, os.path.basename(args.path))
-        else:
-            save_path = os.path.join(save_folder, "camera.mp4")
-        logger.info(f"video save_path is {save_path}")
+        save_path = os.path.join(save_folder, os.path.basename(args.path))
+        logger.info(f"视频保存路径: {save_path}")
         vid_writer = cv2.VideoWriter(
-            save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (int(width), int(height))
+            save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height)
         )
-    while True:
-        ret_val, frame = cap.read()
-        if ret_val:
-            outputs, seg_outputs, img_info = predictor.inference(frame)
-            if seg_outputs is None:
-                seg_outputs = [None for _ in range(len(outputs))]
-            result_frame, seg_mask = predictor.visual(outputs[0], seg_outputs[0], img_info, predictor.confthre, draw_kp=True, draw_seg=False)
-            vid_writer.write(result_frame)
-
-        else:
-            break
-
+    
+    # 4. 初始化tqdm进度条（仅视频场景，有总帧数）
+    pbar = tqdm(total=total_frames, desc="处理视频帧", unit="frame")
+    
+    try:
+        # 5. 逐帧处理视频
+        while True:
+            ret_val, frame = cap.read()
+            if ret_val:
+                # 视频帧推理
+                outputs, seg_outputs, img_info = predictor.inference(frame)
+                if seg_outputs is None:
+                    seg_outputs = [None for _ in range(len(outputs))]
+                # 可视化结果
+                result_frame, seg_mask = predictor.visual(
+                    outputs[0], seg_outputs[0], img_info, 
+                    predictor.confthre, draw_kp=True, draw_seg=False
+                )
+                # 保存处理后的帧
+                if vid_writer is not None:
+                    vid_writer.write(result_frame)
+                # 更新进度条
+                pbar.update(1)
+            else:
+                break  # 视频帧读取完毕
+    
+    except Exception as e:
+        logger.error(f"视频帧处理出错: {e}")
+        raise
+    finally:
+        # 6. 释放所有资源
+        pbar.close()
+        cap.release()
+        if vid_writer is not None:
+            vid_writer.release()
+        # cv2.destroyAllWindows()
+        logger.info(f"视频处理完成，共处理 {pbar.n} 帧")
 
 def crop(masks, boxes, padding=1, mask_ratio=4):
     # h, w = shape
