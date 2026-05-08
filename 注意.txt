@@ -40,8 +40,6 @@ python tools/trt.py -n yolox-ccpd --batch 10 -c model_weights/your_ckpt.pth
 ./trtexec --onnx=yolox-ccpd-192-320.onnx --saveEngine=model.trt --minShapes=images:1x3x192x320 
 --optShapes=images:8x3x192x320 --maxShapes=images:32x3x192x320 --fp16 --workspace=1024
 
-https://zhuanlan.zhihu.com/p/467401558  推理
-
 
 
 

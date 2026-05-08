@@ -276,7 +276,28 @@ class Focus(nn.Module):
         )
         return self.conv(x)
 
-
+class Focus_conv(nn.Module):
+    def __init__(self, in_channels, out_channels, ksize=1, stride=1, act="silu"):
+        super(Focus_conv, self).__init__()
+        self.conv = BaseConv(in_channels * 4, out_channels, ksize, stride, act=act)
+        with torch.no_grad():
+            self.convsp = nn.Conv2d(3, 12, (2, 2), groups=1, bias=False, stride=(2, 2))
+            self.convsp.weight.data = torch.zeros(self.convsp.weight.shape).float()
+            for i in range(4):
+                for j in range(3):
+                    ch = i*3 + j
+                    if ch>=0 and ch<3:
+                        self.convsp.weight[ch:ch+1, j:j+1, 0, 0] = 1
+                    elif ch>=3 and ch<6:
+                        self.convsp.weight[ch:ch+1, j:j+1, 1, 0] = 1
+                    elif ch>=6 and ch<9:
+                        self.convsp.weight[ch:ch+1, j:j+1, 0, 1] = 1
+                    elif ch>=9 and ch<12:
+                        self.convsp.weight[ch:ch+1, j:j+1, 1, 1] = 1
+    
+    def forward(self,x):
+        return self.conv(self.convsp(x))
+    
 ############# instance ###########
 class RFB2(nn.Module):
     def __init__(self, in_planes, out_planes, map_reduce=4, d=[2, 3], has_globel=False):

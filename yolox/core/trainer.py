@@ -166,8 +166,14 @@ class Trainer:
         model = self.resume_train(model)
 
         # data related init
-        self.no_aug = self.start_epoch >= self.max_epoch - self.exp.no_aug_epochs
+        self.no_aug = self.start_epoch >= self.exp.aug_epochs   # self.max_epoch - self.exp.no_aug_epochs
         self.train_loader = self.exp.get_data_loader(
+            batch_size=self.args.batch_size,
+            is_distributed=self.is_distributed,
+            no_aug=self.no_aug,
+            cache_img=self.args.cache,
+        )
+        self.train_loader_finetuning = self.exp.get_data_loader_finetuning(     # 微调数据加载器
             batch_size=self.args.batch_size,
             is_distributed=self.is_distributed,
             no_aug=self.no_aug,
@@ -175,8 +181,10 @@ class Trainer:
         )
         logger.info("init prefetcher, this might take one minute or less...")
         self.prefetcher = DataPrefetcher(self.train_loader)
+        self.prefetcher_finetuning = DataPrefetcher(self.train_loader_finetuning)   # 微调数据预取器
         # max_iter means iters per epoch
         self.max_iter = len(self.train_loader)
+        self.max_iter_finetuning = len(self.train_loader_finetuning)    # 微调数据迭代次数
 
         self.lr_scheduler = self.exp.get_lr_scheduler(
             self.exp.basic_lr_per_img * self.args.batch_size, self.max_iter
@@ -220,10 +228,11 @@ class Trainer:
             if self.args.logger == "wandb":
                 self.wandb_logger.finish()
 
+    #### 负责根据epoch数量来切换数据增强和微调设置 ####
     def before_epoch(self):
         logger.info("---> start train epoch{}".format(self.epoch + 1))
 
-        if self.epoch + 1 == self.max_epoch - self.exp.no_aug_epochs or self.no_aug:
+        if self.epoch + 1 == self.exp.aug_epochs or self.no_aug:    #  - self.exp.no_aug_epochs 
             logger.info("--->No mosaic aug now!")
             self.train_loader.close_mosaic()
             logger.info("--->Add additional L1 loss now!")
@@ -234,6 +243,12 @@ class Trainer:
             self.exp.eval_interval = 1
             if not self.no_aug:
                 self.save_ckpt(ckpt_name="last_mosaic_epoch")
+        ### 切换到微调 ###
+        if self.epoch + 1 == self.exp.aug_epochs + self.exp.no_aug_epochs:    #  - self.exp.no_aug_epochs
+            logger.info("--->Start finetuning now!")
+            self.train_loader_finetuning.close_mosaic()  # 确保微调数据加载器不使用mosaic
+            self.prefetcher = self.prefetcher_finetuning
+            self.max_iter = self.max_iter_finetuning
 
     def after_epoch(self):
         self.save_ckpt(ckpt_name="latest")
@@ -317,10 +332,27 @@ class Trainer:
                 ckpt_file = self.args.ckpt
 
             ckpt = torch.load(ckpt_file, map_location=self.device)
-            # resume the model/optimizer state dict
-            model.load_state_dict(ckpt["model"])
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+            # # resume the model/optimizer state dict
+            # model.load_state_dict(ckpt["model"])
+            # self.optimizer.load_state_dict(ckpt["optimizer"])
+
+            # -------------------------- 处理模型参数加载 --------------------------
+            model_state_dict = model.state_dict()
+            pretrained_model_dict = ckpt["model"]
+            # 过滤模型参数（保留名称和形状均匹配的参数）
+            filtered_model_dict = {
+                k: v for k, v in pretrained_model_dict.items()
+                if k in model_state_dict and v.shape == model_state_dict[k].shape
+            }
+            # 加载过滤后的模型参数
+            model.load_state_dict(filtered_model_dict, strict=False)
+            logger.info("Loaded model weights (unmatched parameters skipped)")
+            # -------------------------- 处理模型参数加载 END--------------------------
+
             self.best_ap = ckpt.pop("best_ap", 0)
+            logger.info(f"Best ap from pretrain is {self.best_ap:.4f}")
+            self.best_ap = 0
+            logger.info(f"Best ap reset to {self.best_ap:.4f}")
             # resume the training states variables
             start_epoch = (
                 self.args.start_epoch - 1

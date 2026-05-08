@@ -5,11 +5,13 @@
 import argparse
 import os
 from loguru import logger
-import os
 import sys
+# activate rknn hack
+if '--rknpu' in sys.argv:
+    os.environ['RKNN_model_hack'] = '1'
+
 # 获取当前文件所在目录的绝对路径
 current_dir = os.path.dirname(os.path.abspath(__file__))
-# 将当前目录添加到系统路径
 sys.path.append(current_dir)
 print("current_dir:", current_dir)
 # 获取祖父目录
@@ -26,46 +28,20 @@ from yolox.utils import replace_module
 
 def make_parser():
     parser = argparse.ArgumentParser("YOLOX onnx deploy")
-    parser.add_argument(
-        "--output-name", type=str, default="yolox.onnx", help="output name of models"
-    )
-    parser.add_argument(
-        "--input", default="images", type=str, help="input node name of onnx model"
-    )
-    parser.add_argument(
-        "--output", default="output", type=str, help="output node name of onnx model"
-    )
-    parser.add_argument(
-        "-o", "--opset", default=12, type=int, help="onnx opset version"
-    )
-    parser.add_argument("-b", "--batch-size", type=int, default=1, help="batch size")
-    parser.add_argument(
-        "--dynamic", default=True, action="store_true", help="whether the input shape should be dynamic or not"
-    )
+    parser.add_argument("--output-name", type=str, default="yolox.onnx", help="output name of models")
+    parser.add_argument("--input", default="images", type=str, help="input node name of onnx model")
+    parser.add_argument("--output", default="output", type=str, help="output node name of onnx model")
+    parser.add_argument("-o", "--opset", default=12, type=int, help="onnx opset version")
+    parser.add_argument("-b", "--batch-size", type=int, default=1, help="batch size (used as fixed batch if dynamic=False)")
+    parser.add_argument("--dynamic", default=True, action="store_true", help="whether the input shape should be dynamic or not")
     parser.add_argument("--no-onnxsim", action="store_true", help="use onnxsim or not")
-    parser.add_argument(
-        "-f",
-        "--exp_file",
-        default=None,
-        type=str,
-        help="experiment description file",
-    )
+    parser.add_argument("-f", "--exp_file", default=None, type=str, help="experiment description file")
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
     parser.add_argument("-c", "--ckpt", default=None, type=str, help="ckpt path")
-    parser.add_argument(
-        "opts",
-        help="Modify config options using the command-line",
-        default=None,
-        nargs=argparse.REMAINDER,
-    )
-    parser.add_argument(
-        "--decode_in_inference",
-        action="store_true",
-        default=True,
-        help="decode in inference or not"
-    )
-
+    parser.add_argument("opts", help="Modify config options using the command-line", default=None, nargs=argparse.REMAINDER)
+    parser.add_argument("--decode_in_inference", action="store_true", default=True, help="decode in inference or not")
+    parser.add_argument('--rknpu', action="store_true", help='RKNN npu platform')
     return parser
 
 
@@ -86,9 +62,7 @@ def main():
     else:
         ckpt_file = args.ckpt
 
-    # load the model state dict
     ckpt = torch.load(ckpt_file, map_location="cpu")
-
     model.eval()
     if "model" in ckpt:
         ckpt = ckpt["model"]
@@ -102,31 +76,30 @@ def main():
     logger.info("loading checkpoint done.")
     dummy_input = torch.randn(args.batch_size, exp.img_channel, exp.test_size[0], exp.test_size[1])
 
-    outputs = model(dummy_input)
+    dynamic_axes = {args.input: {0: 'batch'}, args.output: {0: 'batch'}} if args.dynamic else None
+
     torch.onnx.export(
         model,
         dummy_input,
         args.output_name,
         input_names=[args.input],
         output_names=[args.output],
-        # dynamic_axes={args.input: {0: 'batch'},
-        #               args.output: {0: 'batch'}} if args.dynamic else None,
+        dynamic_axes=dynamic_axes,
         opset_version=args.opset,
     )
     logger.info("generated onnx model named {}".format(args.output_name))
 
     if not args.no_onnxsim:
         import onnx
-
         from onnxsim import simplify
 
-        input_shapes = {args.input: list(dummy_input.shape)} if args.dynamic else None
+        if args.dynamic:
+            input_shapes = None
+        else:
+            input_shapes = {args.input: list(dummy_input.shape)}
 
-        # use onnxsimplify to reduce reduent model.
         onnx_model = onnx.load(args.output_name)
-        model_simp, check = simplify(onnx_model,
-                                    #  dynamic_input_shape=args.dynamic,
-                                     overwrite_input_shapes=input_shapes)
+        model_simp, check = simplify(onnx_model, overwrite_input_shapes=input_shapes)
         assert check, "Simplified ONNX model could not be validated"
         onnx.save(model_simp, args.output_name)
         logger.info("generated simplified onnx model named {}".format(args.output_name))

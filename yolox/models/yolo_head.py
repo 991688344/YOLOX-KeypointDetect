@@ -7,6 +7,7 @@ from loguru import logger
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 
 from yolox.utils import bboxes_iou, meshgrid
 
@@ -30,7 +31,7 @@ class YOLOXHead(nn.Module):
             model_export=False,
             repeat=2,
             decode_in_inference = False,
-            kps_sigmas = [0.25, 0.25, 0.35, 0.35]
+            kps_sigmas = [0.30, 0.25, 0.35, 0.35]
     ):
         """
         Args:
@@ -210,6 +211,7 @@ class YOLOXHead(nn.Module):
 
     def forward(self, xin, labels=None, imgs=None, seg_labels=None):
         outputs = []
+        outputs_RKNN = []
         origin_preds = []
         x_shifts = []
         y_shifts = []
@@ -276,6 +278,13 @@ class YOLOXHead(nn.Module):
                 else:
                     output = torch.cat([reg_output, obj_output.sigmoid(), cls_output.sigmoid()], 1)
             outputs.append(output)
+            outputs_RKNN.append(reg_output)             ##### RKNN输出去除最后的concat层
+            outputs_RKNN.append(obj_output)
+            outputs_RKNN.append(cls_output)
+            if self.keypoints > 0:
+                outputs_RKNN.append(lmk_output)
+            elif self.segcls > 0:
+                outputs_RKNN.append(seg_output)
 
         if self.training:
             return self.get_losses(
@@ -293,6 +302,12 @@ class YOLOXHead(nn.Module):
             )
         else:
             self.hw = [x.shape[-2:] for x in outputs]
+            # logger.info(f"RKNN_model_hack: {os.getenv('RKNN_model_hack', '0')}")  ##########
+            if os.getenv('RKNN_model_hack', '0') in ['1']: ##########
+                # outputs = outputs[1:] # 删除stride=8的reg,obj,cls输出
+                # logger.info("RKNN_model_hack activated!")
+                return outputs_RKNN, None
+
             outputs = torch.cat(
                 [x.flatten(start_dim=2) for x in outputs], dim=2
             ).permute(0, 2, 1)
@@ -701,7 +716,9 @@ class YOLOXHead(nn.Module):
             gt_matched_classes,
             pred_ious_this_matching,
             matched_gt_inds,
-        ) = self.dynamic_k_matching(cost, pair_wise_ious, gt_classes, num_gt, fg_mask)
+        #) = self.dynamic_k_matching(cost, pair_wise_ious, gt_classes, num_gt, fg_mask)
+        ) = self.simota_matching(cost, pair_wise_ious, gt_classes, num_gt, fg_mask)
+
         del pair_wise_cls_loss, cost, pair_wise_ious, pair_wise_ious_loss
 
         if mode == "cpu":
@@ -842,6 +859,98 @@ class YOLOXHead(nn.Module):
         pred_ious_this_matching = (matching_matrix * pair_wise_ious).sum(0)[
             fg_mask_inboxes
         ]
+        return num_fg, gt_matched_classes, pred_ious_this_matching, matched_gt_inds
+
+    def simota_matching(self, cost, pair_wise_ious, gt_classes, num_gt, fg_mask):
+
+        # 若没有候选 anchor，直接返回空结果
+        if cost.size(1) == 0:
+            num_fg = 0
+            return (
+                num_fg,
+                gt_classes.new_tensor([]),
+                pair_wise_ious.new_tensor([]),
+                gt_classes.new_tensor([], dtype=torch.long),
+            )
+
+        matching_matrix = torch.zeros_like(cost, dtype=torch.uint8)
+
+        # -------------------------
+        # 1. 计算 dynamic_k（带安全保护）
+        # -------------------------
+        n_candidate_k = min(10, pair_wise_ious.size(1))
+        if n_candidate_k == 0:
+            # 无候选 anchor，返回空
+            num_fg = 0
+            return (
+                num_fg,
+                gt_classes.new_tensor([]),
+                pair_wise_ious.new_tensor([]),
+                gt_classes.new_tensor([], dtype=torch.long),
+            )
+
+        # topk ious
+        topk_ious, _ = torch.topk(pair_wise_ious, n_candidate_k, dim=1)
+        dynamic_ks = torch.clamp(topk_ious.sum(1).int(), min=1)
+
+        # -------------------------
+        # 2. 对每个 GT 匹配 top-k anchors（安全 topk）
+        # -------------------------
+        for gt_idx in range(num_gt):
+
+            # 当前 gt 的 cost 向量为空
+            if cost[gt_idx].numel() == 0:
+                continue
+
+            # 获取 k，不能超过 anchor 数
+            k = min(dynamic_ks[gt_idx].item(), cost[gt_idx].numel())
+
+            # 执行安全 topk
+            _, pos_idx = torch.topk(cost[gt_idx], k=k, largest=False)
+            matching_matrix[gt_idx][pos_idx] = 1
+
+        del topk_ious, dynamic_ks, pos_idx
+
+        # -------------------------
+        # 3. 处理 anchor 多重匹配
+        # -------------------------
+        anchor_matching_gt = matching_matrix.sum(0)
+
+        if anchor_matching_gt.max() > 1:
+            multiple_match_mask = anchor_matching_gt > 1
+
+            # 找到 cost 最小的 gt
+            _, cost_argmin = torch.min(cost[:, multiple_match_mask], dim=0)
+
+            # 清除所有，需要的设回 1
+            matching_matrix[:, multiple_match_mask] *= 0
+            matching_matrix[cost_argmin, multiple_match_mask] = 1
+
+        fg_mask_inboxes = anchor_matching_gt > 0
+        num_fg = fg_mask_inboxes.sum().item()
+
+        # ----------- copy 回 fg_mask（YOLOX 原始逻辑）---------
+        fg_mask[fg_mask.clone()] = fg_mask_inboxes
+
+        # -------------------------
+        # 4. 得到最终匹配结果
+        # -------------------------
+        if num_fg == 0:
+            # 无前景，返回空结果
+            return (
+                0,
+                gt_classes.new_tensor([]),
+                pair_wise_ious.new_tensor([]),
+                gt_classes.new_tensor([], dtype=torch.long),
+            )
+
+        matched_gt_inds = matching_matrix[:, fg_mask_inboxes].argmax(0)
+        gt_matched_classes = gt_classes[matched_gt_inds]
+
+        pred_ious_this_matching = (
+            (matching_matrix * pair_wise_ious).sum(0)[fg_mask_inboxes]
+        )
+
         return num_fg, gt_matched_classes, pred_ious_this_matching, matched_gt_inds
 
     def crop(self, masks, boxes, padding=1):

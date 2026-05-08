@@ -13,6 +13,8 @@ from ..dataloading import get_yolox_datadir
 from .datasets_wrapper import Dataset
 from .generate_wall_data import RandomDataset
 from pycocotools import mask as maskUtils
+from .coco_classes import IMG_BOARDER
+
 
 def remove_useless_info(coco, segcls):
     """
@@ -209,9 +211,11 @@ class COCODataset(Dataset):
             y2 = np.min((height, y1 + np.max((0, obj["bbox"][3]))))         # bbox
             if self.keypoints > 0:
                 pts = np.array(obj['keypoints'], np.float32).reshape(-1, 3) # keypoint  [x, y, visibility]
+                # if any(pts[:,1]>720):
+                #     print('keypoints exceed image height!')
                 for i in range(len(pts)):
-                    pts[i, 0] = np.min((width, np.max((0, pts[i, 0]))))     # x坐标裁剪到图像内
-                    pts[i, 1] = np.min((height, np.max((0, pts[i, 1]))))    # y坐标裁剪到图像内
+                    pts[i, 0] = np.min((width + IMG_BOARDER, np.max((0 - IMG_BOARDER, pts[i, 0]))))     # x坐标裁剪到图像扩展边界内
+                    pts[i, 1] = np.min((height + IMG_BOARDER, np.max((0 - IMG_BOARDER, pts[i, 1]))))    # y坐标裁剪到图像扩展边界内
                 # xy_pts = pts[:, :2].reshape(-1)     # [x, y, visible] 去掉visible标记，只留下坐标x,y值
                 xy_pts = pts.reshape(-1)     # [x, y, visible] 保留visible标记
             if self.segcls > 0:
@@ -295,6 +299,8 @@ class COCODataset(Dataset):
         file_name = self.annotations[index][3]
         img_file = os.path.join(self.data_dir, self.name, file_name)
         img = cv2.imread(img_file)
+        if img is None:
+            print("Error: load image {} failed!".format(img_file))
         assert img is not None
         return img
 

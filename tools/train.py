@@ -7,7 +7,7 @@ import random
 import warnings
 from loguru import logger
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='2'
+os.environ['CUDA_VISIBLE_DEVICES']='1'
 
 import sys
 # 获取当前文件所在目录的绝对路径

@@ -5,7 +5,8 @@
 import argparse
 import os
 import time
-import glob  # 新增：用于遍历视频文件
+import glob
+import shutil  # 新增：用于文件复制
 from loguru import logger
 from tqdm import tqdm  
 
@@ -29,7 +30,14 @@ IMG_BOARDER = 100
 from typing import Tuple
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
-VIDEO_EXT = [".mp4", ".avi", ".mov", ".flv", ".mkv"]  # 新增：支持的视频格式
+VIDEO_EXT = [".mp4", ".avi", ".mov", ".flv", ".mkv"]
+
+# ====================== 新增：分类保存路径配置 ======================
+HAS_PHONE_DIR = "/home/liuyc/workspace/dataset/hasPhoneCall"
+NO_PHONE_DIR = "/home/liuyc/workspace/dataset/noPhoneCall"
+HAS_SMOKE_DIR = "/home/liuyc/workspace/dataset/hasSmoke"
+NO_SMOKE_DIR = "/home/liuyc/workspace/dataset/noSmoke"
+# ====================================================================
 
 COLORS = np.array([[0, 0, 0], [244, 67, 54], [233, 30, 99], [156, 39, 176], [103, 58, 183], [100, 30, 60],
                    [63, 81, 181], [33, 150, 243], [3, 169, 244], [0, 188, 212], [20, 55, 200],
@@ -129,19 +137,16 @@ def get_image_list(path):
                 image_names.append(apath)
     return image_names
 
-# 新增：获取视频文件列表（支持目录/单个文件）
 def get_video_list(path):
     video_names = []
     if os.path.isdir(path):
-        # 遍历目录下所有视频文件
         for ext in VIDEO_EXT:
             video_names.extend(glob.glob(os.path.join(path, f"*{ext}")))
-            video_names.extend(glob.glob(os.path.join(path, f"*{ext.upper()}")))  # 兼容大写后缀
+            video_names.extend(glob.glob(os.path.join(path, f"*{ext.upper()}")))
     elif os.path.isfile(path):
         ext = os.path.splitext(path)[1].lower()
         if ext in VIDEO_EXT:
             video_names.append(path)
-    # 去重+排序
     video_names = sorted(list(set(video_names)))
     return video_names
 
@@ -208,12 +213,11 @@ class Predictor(object):
         if self.device == "gpu":
             img = img.cuda()
             if self.fp16:
-                img = img.half()  # to FP16
+                img = img.half()
 
         with torch.no_grad():
             t0 = time.time()
-            
-            if self.decoder is not None:  # None
+            if self.decoder is not None:
                 outputs, seg_output = self.model(img)
                 outputs, seg_output = self.decoder(outputs, seg_output, dtype=outputs.type())
             else:
@@ -233,16 +237,13 @@ class Predictor(object):
                 outputs[0], letterbox_info, self.num_classes, self.confthre,
                 self.nmsthre, class_agnostic=False, keypoints=self.keypoints, segs=self.segs
             )
-            # logger.info("Infer time: {:.4f}s".format(time.time() - t0))
         return outputs, seg_output, img_info
 
     def visual(self, output, seg_output, img_info, cls_conf=0.35, draw_kp=False, draw_seg=False) -> Tuple[np.ndarray, np.ndarray]:
         ratio = img_info["ratio"]
-        img = img_info["raw_img"].copy()  # 复制原始图像，720, 1280
+        img = img_info["raw_img"].copy()
         h, w, _ = img.shape
         
-        # ===================== 核心修改1：填充图像边界 =====================
-        # 对原始图像进行四周填充，填充颜色为黑色(0)，上下左右各填充IMG_BOARDER像素
         img = cv2.copyMakeBorder(
             img,
             top=IMG_BOARDER,
@@ -250,29 +251,23 @@ class Predictor(object):
             left=IMG_BOARDER,
             right=IMG_BOARDER,
             borderType=cv2.BORDER_CONSTANT,
-            value=[0, 0, 0]  # 填充黑色背景
+            value=[0, 0, 0]
         )
-        # 计算填充后的新图像尺寸
         new_h = h + 2 * IMG_BOARDER
         new_w = w + 2 * IMG_BOARDER
-        # =================================================================
-        
-        # 初始化分割掩码（尺寸与填充后的图像一致）
         seg_mask = np.zeros_like(img)
 
         if output is None:
             return img, seg_mask
 
         output = output.cpu()
-        output_np = output.numpy()  # 张量 → NumPy数组
+        output_np = output.numpy()
 
-        # 还原坐标到原始图像尺度（未填充前）
-        bboxes = output_np[:, 0:4] / ratio          # [360, 720] --> [720, 1280]
-        cls_ids = output_np[:, 6].astype(int)       
-        scores = output_np[:, 4] * output_np[:, 5]  
-        kps_list = output_np[:, 7:] / ratio if draw_kp else None  # 还原到原始图像尺度
+        bboxes = output_np[:, 0:4] / ratio
+        cls_ids = output_np[:, 6].astype(int)
+        scores = output_np[:, 4] * output_np[:, 5]
+        kps_list = output_np[:, 7:] / ratio if draw_kp else None
 
-        # 步骤1：过滤低置信度的检测框
         valid_mask = scores >= cls_conf
         bboxes = bboxes[valid_mask]
         cls_ids = cls_ids[valid_mask]
@@ -280,37 +275,28 @@ class Predictor(object):
         
         if draw_kp:
             kps_list = kps_list[valid_mask]
-            kp_num = kps_list.shape[1] // 3  # 计算每个目标的关键点数量
-            kps_list = kps_list.reshape(-1, kp_num, 3)  # 重塑为[N, k, 3]
+            kp_num = kps_list.shape[1] // 3
+            kps_list = kps_list.reshape(-1, kp_num, 3)
 
-        # 后续逐框绘制逻辑
         for i in range(len(bboxes)):
-            # ===================== 核心修改2：偏移检测框坐标 =====================
-            # 原始坐标 + 填充偏移量（让检测框对应到填充后的图像位置）
             x1, y1, x2, y2 = bboxes[i]
             x1 += IMG_BOARDER
             y1 += IMG_BOARDER
             x2 += IMG_BOARDER
             y2 += IMG_BOARDER
             x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-            # =================================================================
             
             cls_id = cls_ids[i]
             score = scores[i]
             cls_name = self.cls_names[cls_id]
 
-            # 获取该检测框的专属颜色
             color = COLORS[(cls_id+10) % len(COLORS)].tolist()
-
-            # 绘制检测框（基于填充后的坐标）
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness=2)
             
-            # 绘制类别名称和置信度（适配填充后的图像边界）
             text = f"{cls_name}: {score:.2f}"
             text_size, _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             text_x = x1
             text_y = y1 - 10 if y1 - 10 > 0 else y1 + 20
-            # 确保文本不超出填充后图像的边界
             text_y = max(text_y, text_size[1] + 2)
             text_y = min(text_y, new_h - 2)
             cv2.rectangle(img, (text_x, text_y - text_size[1] - 2), 
@@ -318,37 +304,26 @@ class Predictor(object):
             cv2.putText(img, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (255, 0, 255), thickness=1)
 
-            # 绘制关键点
             if draw_kp and kps_list is not None:
                 kps = kps_list[i]
-                if cls_name in ['Face', 'Smoking', 'Phone']:  # 这三类不绘制关键点
+                if cls_name in ['Face', 'Smoking', 'Phone']:
                     continue
-                if cls_name == "Seatbelt":  # 安全带只取前两点
+                if cls_name == "Seatbelt":
                     kps = kps[:2]
                 
                 for idx, (kx, ky, visable) in enumerate(kps):
-                    # ===================== 核心修改3：偏移关键点坐标 =====================
-                    # 原始关键点坐标 + 填充偏移量
                     kx += IMG_BOARDER
                     ky += IMG_BOARDER
-                    # =================================================================
-                    
                     kx = int(kx)
                     ky = int(ky)
-                    kp_radius = 6  # 关键点半径
+                    kp_radius = 6
                     
-                    # ===================== 核心修改4：更新关键点边界判断 =====================
-                    # 边界判断改为填充后的图像尺寸，不再限制原图像范围
                     if 0 <= kx < new_w and 0 <= ky < new_h:
-                    # =================================================================
-                        # 绘制放大后的关键点（实心圆）
                         cv2.circle(img, (kx, ky), radius=kp_radius, color=color, thickness=-1)
                         
-                        # 绘制关键点编号（适配填充后的图像边界）
-                        num_offset = 12  # 编号偏移量
+                        num_offset = 12
                         text_x = kx
                         text_y = ky - num_offset
-                        # 确保编号文本不超出填充后的图像边界
                         if text_y < 0:
                             text_y = ky + num_offset
                         if text_x < 0:
@@ -358,21 +333,16 @@ class Predictor(object):
                         text_y = max(text_y, text_size[1] + 2)
                         text_y = min(text_y, new_h - 2)
                         
-                        # 关键点编号（从0开始，可改为idx+1从1开始）
                         kp_num = str(idx)
-                        
-                        # 绘制编号文本背景
                         text_size, _ = cv2.getTextSize(kp_num, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
                         cv2.rectangle(img, (text_x - text_size[0]//2, text_y - text_size[1] - 2),
                                     (text_x + text_size[0]//2, text_y + 2), color, -1)
-                        # 绘制编号文本（白色字体）
                         cv2.putText(img, kp_num, (text_x - text_size[0]//2, text_y),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), thickness=1)
 
-                # 绘制关键点线段（适配填充后的坐标）
                 kp_connections = {
-                    "Person": [(0, 1), (1, 2), (1, 3)],  # Person的连接对
-                    "Seatbelt": [(0, 1)]                  # Seatbelt的连接对
+                    "Person": [(0, 1), (1, 2), (1, 3)],
+                    "Seatbelt": [(0, 1)]
                 }
                 if cls_name in kp_connections:
                     connections = kp_connections[cls_name]
@@ -381,21 +351,17 @@ class Predictor(object):
                     for (p1_idx, p2_idx) in connections:
                         if p1_idx >= current_kp_num or p2_idx >= current_kp_num:
                             continue
-                        # 获取原始关键点坐标并偏移
                         kx1, ky1, vis1 = kps[p1_idx]
                         kx2, ky2, vis2 = kps[p2_idx]
                         kx1 += IMG_BOARDER
                         ky1 += IMG_BOARDER
                         kx2 += IMG_BOARDER
                         ky2 += IMG_BOARDER
-                        # 转为整数
                         kx1, ky1 = int(kx1), int(ky1)
                         kx2, ky2 = int(kx2), int(ky2)
-                        # 边界判断（填充后的尺寸）
                         if (0 <= kx1 < new_w and 0 <= ky1 < new_h) and (0 <= kx2 < new_w and 0 <= ky2 < new_h):
                             cv2.line(img, (kx1, ky1), (kx2, ky2), color, thickness=line_thickness)
 
-        # 分割绘制逻辑（适配填充后的图像）
         if draw_seg and seg_output is not None:
             sh, sw = seg_output.shape[:2]
             masks = torch.sigmoid(torch.matmul(seg_output, output[:, 7:].t()))
@@ -409,8 +375,6 @@ class Predictor(object):
             seg = seg * (cls_ids + 1)[:, None, None]
             seg = seg.astype('int').sum(axis=0)
             
-            # ===================== 核心修改5：填充分割掩码 =====================
-            # 原始分割掩码尺寸是(h, w)，需要填充到(new_h, new_w)
             seg = cv2.copyMakeBorder(
                 seg,
                 top=IMG_BOARDER,
@@ -420,74 +384,92 @@ class Predictor(object):
                 borderType=cv2.BORDER_CONSTANT,
                 value=0
             )
-            # 确保分割掩码尺寸与填充后的图像一致
             seg_mask = seg.astype(np.uint8)
-            # =================================================================
 
         return img, seg_mask
 
-
+# ====================== 核心修改：重写图片推理+分类函数 ======================
 def image_demo(predictor, vis_folder, path, current_time, save_result, draw_kp, draw_seg):
+    # 自动创建所有分类文件夹
+    for dir_path in [HAS_PHONE_DIR, NO_PHONE_DIR, HAS_SMOKE_DIR, NO_SMOKE_DIR]:
+        os.makedirs(dir_path, exist_ok=True)
+
+    # 获取所有图片
     if os.path.isdir(path):
         files = get_image_list(path)
     else:
         files = [path]
     files.sort()
+
     for image_name in files:
+        # 1. 模型推理
         outputs, seg_outputs, img_info = predictor.inference(image_name)
+        # 2. 初始化检测标志
+        has_phone = False
+        has_smoke = False
+
+        # 3. 解析推理结果，判断是否包含Phone/Smoking
+        if outputs[0] is not None:
+            output = outputs[0].cpu()
+            cls_ids = output[:, 6].cpu().numpy().astype(int)
+
+            # 遍历所有检测目标
+            for cls_id in cls_ids:
+                cls_name = predictor.cls_names[cls_id]
+                if cls_name == "Phone":
+                    has_phone = True
+                if cls_name == "Smoking":
+                    has_smoke = True
+
+        # 4. 按规则复制图片到对应文件夹
+        img_filename = os.path.basename(image_name)
+        # 复制Phone分类
+        if has_phone:
+            shutil.copy2(image_name, os.path.join(HAS_PHONE_DIR, img_filename))
+            logger.info(f"✅ 检测到Phone: {img_filename} → 已复制到hasPhoneCall")
+        else:
+            shutil.copy2(image_name, os.path.join(NO_PHONE_DIR, img_filename))
+            logger.info(f"❌ 未检测到Phone: {img_filename} → 已复制到noPhoneCall")
+        # 复制Smoke分类
+        if has_smoke:
+            shutil.copy2(image_name, os.path.join(HAS_SMOKE_DIR, img_filename))
+            logger.info(f"✅ 检测到Smoking: {img_filename} → 已复制到hasSmoke")
+        else:
+            shutil.copy2(image_name, os.path.join(NO_SMOKE_DIR, img_filename))
+            logger.info(f"❌ 未检测到Smoking: {img_filename} → 已复制到noSmoke")
+
+        # 保留原有的可视化保存功能（可选）
         if seg_outputs is None:
             seg_outputs = [None for _ in range(len(outputs))]
         result_image, seg_mask = predictor.visual(outputs[0], seg_outputs[0], img_info, predictor.confthre, draw_kp, draw_seg)
         if save_result:
-            save_folder = os.path.join(
-                vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-            )
+            save_folder = os.path.join(vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time))
             os.makedirs(save_folder, exist_ok=True)
             save_file_name = os.path.join(save_folder, os.path.basename(image_name))
-            logger.info("Saving detection result in {}".format(save_file_name))
             cv2.imwrite(save_file_name, result_image)
-            if draw_seg:
-                if '.jpg' in save_file_name:
-                    cv2.imwrite(save_file_name.replace('.jpg', '_seg.jpg'), seg_mask)
-                else:
-                    cv2.imwrite(save_file_name.replace('.png', '_seg.png'), seg_mask)
+# ============================================================================
 
-# 新增：封装 单个视频处理 函数
 def process_single_video(predictor, vis_folder, current_time, video_path, args):
-    """处理单个视频文件"""
-    # 打开视频文件
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         logger.error(f"无法打开视频文件: {video_path}")
         return
     
-    # 获取视频基础信息
     orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # 计算填充后的新尺寸
     new_width = orig_width + 2 * IMG_BOARDER
     new_height = orig_height + 2 * IMG_BOARDER
     
-    # 初始化视频保存
     vid_writer = None
     if args.save_result:
-        save_folder = os.path.join(
-            vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time)
-        )
+        save_folder = os.path.join(vis_folder, time.strftime("%Y_%m_%d_%H_%M_%S", current_time))
         os.makedirs(save_folder, exist_ok=True)
-        save_path = os.path.join(save_folder, os.path.basename(video_path))
-        logger.info(f"视频保存路径: {save_path}")
-        vid_writer = cv2.VideoWriter(
-            save_path, 
-            cv2.VideoWriter_fourcc(*"mp4v"), 
-            fps, 
-            (new_width, new_height)
-        )
+        save_path = os.path.join(save_folder, os.basename(video_path))
+        vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (new_width, new_height))
     
-    # 进度条
     pbar = tqdm(total=total_frames, desc=f"处理视频: {os.path.basename(video_path)}", unit="frame")
     
     try:
@@ -497,16 +479,12 @@ def process_single_video(predictor, vis_folder, current_time, video_path, args):
                 outputs, seg_outputs, img_info = predictor.inference(frame)
                 if seg_outputs is None:
                     seg_outputs = [None for _ in range(len(outputs))]
-                result_frame, seg_mask = predictor.visual(
-                    outputs[0], seg_outputs[0], img_info, 
-                    predictor.confthre, draw_kp=True, draw_seg=False
-                )
+                result_frame, seg_mask = predictor.visual(outputs[0], seg_outputs[0], img_info, predictor.confthre, draw_kp=True, draw_seg=False)
                 if vid_writer is not None:
                     vid_writer.write(result_frame)
                 pbar.update(1)
             else:
                 break
-    
     except Exception as e:
         logger.error(f"视频帧处理出错: {e}")
         raise
@@ -515,29 +493,17 @@ def process_single_video(predictor, vis_folder, current_time, video_path, args):
         cap.release()
         if vid_writer is not None:
             vid_writer.release()
-        logger.info(f"视频处理完成: {os.path.basename(video_path)}，共处理 {pbar.n} 帧")
+        logger.info(f"视频处理完成: {os.path.basename(video_path)}")
 
-# 修改：视频主处理函数（支持目录+单个视频）
 def imageflow_demo(predictor, vis_folder, current_time, args):
-    # 获取所有视频文件列表
     video_list = get_video_list(args.path)
-    
     if not video_list:
-        logger.error(f"未在路径 {args.path} 中找到任何视频文件！")
+        logger.error(f"未找到视频文件！")
         return
-    
-    logger.info(f"共找到 {len(video_list)} 个视频文件，开始依次推理...")
-    
-    # 遍历所有视频，逐个处理
-    for idx, video_path in enumerate(video_list, 1):
-        logger.info(f"\n===== 正在处理第 {idx}/{len(video_list)} 个视频: {video_path} =====")
+    for video_path in video_list:
         process_single_video(predictor, vis_folder, current_time, video_path, args)
-    
-    logger.info("===== 所有视频推理完成！ =====")
-
 
 def crop(masks, boxes, padding=1, mask_ratio=4):
-    # h, w = shape
     h, w, n = masks.size()
     box_corner = boxes.clone()
     box_corner[..., 0] /= w * mask_ratio
@@ -557,24 +523,15 @@ def crop(masks, boxes, padding=1, mask_ratio=4):
     masks_down = cols < y2.view(1, 1, -1)
 
     crop_mask = masks_left * masks_right * masks_up * masks_down
-
     return masks * crop_mask.float()
 
 def sanitize_coordinates(_x1, _x2, img_size, padding=0):
-    """
-    Sanitizes the input coordinates so that x1 < x2, x1 != x2, x1 >= 0, and x2 <= image_size.
-    Also converts from relative to absolute coordinates and casts the results to long tensors.
-
-    Warning: this does things in-place behind the scenes so copy if necessary.
-    """
     _x1 = _x1 * img_size
     _x2 = _x2 * img_size
-
     x1 = torch.min(_x1, _x2)
     x2 = torch.max(_x1, _x2)
     x1 = torch.clamp(x1 - padding, min=0)
     x2 = torch.clamp(x2 + padding, max=img_size)
-
     return x1, x2
 
 def main(exp, args):
@@ -592,42 +549,33 @@ def main(exp, args):
     if args.trt:
         args.device = "gpu"
 
-    logger.info("Args: {}".format(args))
-
     exp.decode_in_inference = True
     model = exp.get_model()
 
     if args.device == "gpu":
         model.cuda()
         if args.fp16:
-            model.half()  # to FP16
+            model.half()
     if exp.model_name == 'yolov7_tiny':
         model.fuse()
     model.eval()
 
     if not args.trt:
-        if args.ckpt is None:
-            ckpt_file = os.path.join(file_name, "best_ckpt.pth")
-        else:
-            ckpt_file = args.ckpt
+        ckpt_file = args.ckpt if args.ckpt else os.path.join(file_name, "best_ckpt.pth")
         logger.info("loading checkpoint")
         ckpt = torch.load(ckpt_file, map_location="cpu")
         model.load_state_dict(ckpt["model"])
         logger.info("loaded checkpoint done.")
 
     if args.fuse:
-        logger.info("\tFusing model...")
         model = fuse_model(model)
 
     if args.trt:
-        assert not args.fuse, "TensorRT model is not support model fusing!"
+        assert not args.fuse, "TensorRT不支持模型融合！"
         trt_file = os.path.join(file_name, "model_trt.pth")
-        assert os.path.exists(
-            trt_file
-        ), "TensorRT model is not found!\n Run python3 tools/trt.py first!"
+        assert os.path.exists(trt_file), "请先运行trt.py！"
         model.head.decode_in_inference = False
         decoder = model.head.decode_outputs
-        logger.info("Using TensorRT to inference")
     else:
         trt_file = None
         decoder = None

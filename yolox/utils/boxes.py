@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torchvision
 import torch.nn.functional as F
+# from ..data.datasets.coco_classes import IMG_BOARDER 
+IMG_BOARDER = 300   # 图片扩展边界，与X-AnyLabeling中设置保持一致
 
 __all__ = [
     "filter_box",
@@ -129,9 +131,9 @@ def postprocess(prediction, letterbox_info, num_classes, conf_thre=0.7, nms_thre
             kpts[:, 0::3] = (kpts[:, 0::3] - dx) #/ r
             # y列（1/3/5/7/9/11）：减dy后除以r
             kpts[:, 1::3] = (kpts[:, 1::3] - dy) #/ r
-            # 对齐检测框的裁剪范围（img_w*r / img_h*r），避免关键点超出图像范围
-            kpts[:, 0::3] = torch.clamp(kpts[:, 0::3], 0, img_w * r)  # x坐标 ∈ [0, img_w*r]
-            kpts[:, 1::3] = torch.clamp(kpts[:, 1::3], 0, img_h * r)  # y坐标 ∈ [0, img_h*r]
+            # 对齐检测框的裁剪范围（img_w*r / img_h*r），避免关键点超出图像扩展范围
+            kpts[:, 0::3] = torch.clamp(kpts[:, 0::3], (0 - IMG_BOARDER) * r, (img_w + IMG_BOARDER) * r)  # x坐标 ∈ [0, img_w*r]
+            kpts[:, 1::3] = torch.clamp(kpts[:, 1::3], (0 - IMG_BOARDER) * r, (img_h + IMG_BOARDER) * r)  # y坐标 ∈ [0, img_h*r]
             # 放回detections
             detections[:, 7:19] = kpts
 
@@ -174,7 +176,6 @@ def bboxes_iou(bboxes_a, bboxes_b, xyxy=True):
     area_i = torch.prod(br - tl, 2) * en  # * ((tl < br).all())
     return area_i / (area_a[:, None] + area_b - area_i)
 
-
 def matrix_iou(a, b):
     """
     return iou of a and b, numpy version for data augenmentation
@@ -186,7 +187,6 @@ def matrix_iou(a, b):
     area_a = np.prod(a[:, 2:] - a[:, :2], axis=1)
     area_b = np.prod(b[:, 2:] - b[:, :2], axis=1)
     return area_i / (area_a[:, np.newaxis] + area_b - area_i + 1e-12)
-
 
 def adjust_box_anns(bbox, scale_ratio, padw, padh, w_max, h_max):
     bbox[:, 0::2] = np.clip(bbox[:, 0::2] * scale_ratio + padw, 0, w_max)
@@ -207,12 +207,10 @@ def adjust_lmks_anns(landmarks, scale_ratio, padw, padh, w_max, h_max):
                 landmarks[j][2 * k + 1] = -1
     return landmarks
 
-
 def xyxy2xywh(bboxes):
     bboxes[:, 2] = bboxes[:, 2] - bboxes[:, 0]
     bboxes[:, 3] = bboxes[:, 3] - bboxes[:, 1]
     return bboxes
-
 
 def xyxy2cxcywh(bboxes):
     bboxes[:, 2] = bboxes[:, 2] - bboxes[:, 0]
@@ -220,7 +218,6 @@ def xyxy2cxcywh(bboxes):
     bboxes[:, 0] = bboxes[:, 0] + bboxes[:, 2] * 0.5
     bboxes[:, 1] = bboxes[:, 1] + bboxes[:, 3] * 0.5
     return bboxes
-
 
 def bboxes_iou_batch(bboxes_a, bboxes_b, xyxy=True):
     """计算两组矩形两两之间的iou

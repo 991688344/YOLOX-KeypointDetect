@@ -16,14 +16,14 @@ class Exp(MyExp):
     def __init__(self):
         super(Exp, self).__init__()
         # #### n
-        # self.depth = 0.33
-        # self.width = 0.25
+        self.depth = 0.33
+        self.width = 0.25
         # #### s
         # self.depth = 0.33
         # self.width = 0.50
         #### m
-        self.depth = 0.67
-        self.width = 0.75
+        # self.depth = 0.67
+        # self.width = 0.75
         #### l
         # self.depth = 1.0
         # self.width = 1.0
@@ -61,32 +61,36 @@ class Exp(MyExp):
         self.data_dir = 'datasets/YaXon_DMS_OD_Keypoint'
         self.train_ann = "person_keypoints_train2017.json"
         self.val_ann = "person_keypoints_val2017.json"
-
+        self.finetuning_train_ann = "person_keypoints_train2017.json"  # 微调数据集标签
         # --------------- transform config ----------------- #
-        self.mosaic_prob = 0.3
+        self.mosaic_prob = 0.4#
         self.mixup_prob = 0
         self.hsv_prob = 0.7
-        self.flip_prob = 0.3
+        self.flip_prob = 0.7
         self.degrees = 10.0
         self.translate = 0.1
-        self.mosaic_scale = (0.3, 1.5)
+        self.mosaic_scale = (0.5, 1.5)
         self.mixup_scale = (0.5, 1.5)
         self.shear = 2.0
         self.perspective = 1
         self.enable_mixup = False
 
         # --------------  training config --------------------- #
-        self.warmup_epochs = 5
-        self.max_epoch = 1300
+        self.warmup_epochs = 10
+        # self.max_epoch = 1300
         self.warmup_lr = 0
         self.adam = False
-        self.basic_lr_per_img = 0.001 / 64.0 if self.adam else 0.01 / 64.0
+        self.basic_lr_per_img = 0.001 / 32.0 if self.adam else 0.01 / 32.0
         self.scheduler = "yoloxwarmcos"
-        self.no_aug_epochs = 150
+        self.aug_epochs = 1600              # 数据增强训练轮次
+        self.no_aug_epochs = 400            # 非数据增强训练轮次
+        self.finetuning_train_epoch = 0   # 微调数据集训练轮次
+        self.max_epoch = self.aug_epochs + self.no_aug_epochs + self.finetuning_train_epoch     # 总训练轮次
+
         self.min_lr_ratio = 0.05
         self.ema = True
 
-        self.weight_decay = 5e-4
+        self.weight_decay = 4e-4
         self.momentum = 0.9
         self.print_interval = 10
         self.eval_interval = 10
@@ -112,28 +116,28 @@ class Exp(MyExp):
         if getattr(self, "model", None) is None:
             if self.model_name == 'CoAtNet_pafpn':
                 backbone = YOLOPAFPN(self.img_channel, self.depth, self.width, in_channels=self.in_channels,
-                                     in_features=self.in_features, backbone_name='CoAtNet', act=self.act,
-                                     input_size=self.input_size)
+                                    in_features=self.in_features, backbone_name='CoAtNet', act=self.act,
+                                    input_size=self.input_size)
             elif self.model_name == 'yolo_pafpn_slim':
                 backbone = YOLOPAFPNSLIM(self.img_channel, self.depth, self.width, in_channels=self.in_channels,
-                                         in_features=self.in_features, act=self.act,
-                                         input_size=self.input_size)
+                                        in_features=self.in_features, act=self.act,
+                                        input_size=self.input_size)
             elif self.model_name == 'yolov7_tiny':
                 self.in_channels = [256, 512, 1024]
                 backbone = YOLO7TINY(self.img_channel, self.depth, self.width, in_channels=self.in_channels,
-                                     in_features=self.in_features, act=self.act,
-                                     input_size=self.input_size)
+                                    in_features=self.in_features, act=self.act,
+                                    input_size=self.input_size)
             else:
                 backbone = YOLOPAFPN(self.img_channel, self.depth, self.width, in_channels=self.in_channels,
-                                     in_features=self.in_features, act=self.act,
-                                     depthwise=False,
-                                     input_size=self.input_size)
+                                    in_features=self.in_features, act=self.act,
+                                    depthwise=False,
+                                    input_size=self.input_size)
 
             head = YOLOXHead(self.num_classes, self.width, in_channels=self.in_channels, act=self.act,
-                             keypoints=self.keypoints, segcls=self.segcls, model_export=self.model_export,
-                             repeat=self.repeat,
-                             depthwise=False,
-                             decode_in_inference = self.decode_in_inference)
+                            keypoints=self.keypoints, segcls=self.segcls, model_export=self.model_export,
+                            repeat=self.repeat,
+                            depthwise=True,
+                            decode_in_inference = self.decode_in_inference)
             self.model = YOLOX(backbone, head)
 
         self.model.apply(init_yolo)
@@ -216,6 +220,84 @@ class Exp(MyExp):
         train_loader = DataLoader(self.dataset, **dataloader_kwargs)
 
         return train_loader
+
+    # 用来最后微调的数据集，一般是样本少的巡检误报视频，由参数
+    def get_data_loader_finetuning(self, batch_size, is_distributed, no_aug=False, cache_img=False):
+        from yolox.data import (
+            COCODataset,
+            TrainTransform,
+            YoloBatchSampler,
+            DataLoader,
+            InfiniteSampler,
+            MosaicDetection,
+            worker_init_reset_seed,
+        )
+        from yolox.utils import wait_for_the_master
+
+        with wait_for_the_master():
+            dataset = COCODataset(
+                data_dir=self.data_dir,
+                json_file=self.finetuning_train_ann,
+                img_size=self.input_size,
+                keypoints=self.keypoints,
+                segcls=self.segcls,
+                random_dataset=self.random_dataset,
+                preproc=TrainTransform(
+                    max_labels=50,
+                    flip_prob=self.flip_prob,
+                    hsv_prob=self.hsv_prob,
+                    keypoints=self.keypoints,
+                    segcls=self.segcls),
+                cache=cache_img,
+            )
+
+        dataset = MosaicDetection(
+            dataset,
+            mosaic=not no_aug,  # 是否使用增强
+            img_size=self.input_size,
+            keypoints=self.keypoints,
+            segcls=self.segcls,
+            preproc=TrainTransform(
+                max_labels=120,
+                flip_prob=self.flip_prob,
+                hsv_prob=self.hsv_prob,
+                keypoints=self.keypoints,
+                segcls=self.segcls),
+            degrees=self.degrees,  # 旋转角度 10
+            translate=self.translate,  # 平移 0.1
+            mosaic_scale=self.mosaic_scale,  # 尺度 (0.1, 2)
+            mixup_scale=self.mixup_scale,  # 尺度 (0.5, 1.5)
+            shear=self.shear,  # 裁剪 2.0
+            enable_mixup=self.enable_mixup,  # 是否使用mixup
+            mosaic_prob=self.mosaic_prob,  # 概率 1.0
+            mixup_prob=self.mixup_prob,  # 概率 1.0
+        )
+
+        self.dataset = dataset
+
+        if is_distributed:
+            batch_size = batch_size // dist.get_world_size()
+
+        sampler = InfiniteSampler(len(self.dataset), seed=self.seed if self.seed else 0)
+
+        batch_sampler = YoloBatchSampler(
+            sampler=sampler,
+            batch_size=batch_size,
+            drop_last=False,
+            mosaic=not no_aug,
+        )
+
+        dataloader_kwargs = {"num_workers": self.data_num_workers, "pin_memory": self.pin_memory}
+        dataloader_kwargs["batch_sampler"] = batch_sampler
+
+        # Make sure each process has different random seed, especially for 'fork' method.
+        # Check https://github.com/pytorch/pytorch/issues/63311 for more details.
+        dataloader_kwargs["worker_init_fn"] = worker_init_reset_seed
+
+        train_loader = DataLoader(self.dataset, **dataloader_kwargs)
+
+        return train_loader
+
 
     def random_resize(self, data_loader, epoch, rank, is_distributed):
         tensor = torch.LongTensor(2).cuda()
