@@ -41,4 +41,10 @@ def save_checkpoint(state, is_best, save_dir, model_name=""):
     if is_best:
         best_filename = os.path.join(save_dir, "best_ckpt.pth")
         shutil.copyfile(filename, best_filename)
-        logger.info("New best AP50_95: {:.2f}, KP_AP50_95: {:.2f}, saving best weights: {}.".format(state["curr_ap"] * 100, state["curr_kp_ap"] * 100, best_filename))
+        curr_ap = state.get("curr_ap")
+        curr_kp_ap = state.get("curr_kp_ap")
+        if curr_ap is not None and curr_kp_ap is not None:
+            logger.info("New best AP50_95: {:.2f}, KP_AP50_95: {:.2f}, saving best weights: {}.".format(curr_ap * 100, curr_kp_ap * 100, best_filename))
+        else:
+            # QAT 等无 COCO 评估指标的场景：无 AP 值，仅保存 best 权重
+            logger.info("Saving best weights: {}.".format(best_filename))

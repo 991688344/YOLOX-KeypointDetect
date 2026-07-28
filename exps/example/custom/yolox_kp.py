@@ -43,7 +43,7 @@ class Exp(MyExp):
         self.model_name = 'yolo_pafpn'
         self.repeat = 2
         self.decode_in_inference = False
-        self.data_num_workers = 4
+        self.data_num_workers = 6
         self.input_size = (384, 640)  # (height, width)
         self.multiscale_range = 5
 
@@ -82,19 +82,20 @@ class Exp(MyExp):
         self.adam = False
         self.basic_lr_per_img = 0.001 / 32.0 if self.adam else 0.01 / 32.0
         self.scheduler = "yoloxwarmcos"
-        self.aug_epochs = 1600              # 数据增强训练轮次
-        self.no_aug_epochs = 400            # 非数据增强训练轮次
+        self.aug_epochs = 1500              # 数据增强训练轮次
+        self.no_aug_epochs = 300            # 非数据增强训练轮次
         self.finetuning_train_epoch = 0   # 微调数据集训练轮次
         self.max_epoch = self.aug_epochs + self.no_aug_epochs + self.finetuning_train_epoch     # 总训练轮次
 
-        self.min_lr_ratio = 0.05
+        self.min_lr_ratio = 0.1 #05
         self.ema = True
 
-        self.weight_decay = 4e-4
+        self.weight_decay = 5e-5 #4e-4
         self.momentum = 0.9
         self.print_interval = 10
         self.eval_interval = 10
         self.save_history_ckpt = False
+        self.save_history_ckpt_interval = 100
         self.exp_name = os.path.split(os.path.realpath(__file__))[1].split(".")[0]
 
         # -----------------  testing config ------------------ #

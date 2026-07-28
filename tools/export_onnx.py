@@ -33,7 +33,8 @@ def make_parser():
     parser.add_argument("--output", default="output", type=str, help="output node name of onnx model")
     parser.add_argument("-o", "--opset", default=12, type=int, help="onnx opset version")
     parser.add_argument("-b", "--batch-size", type=int, default=1, help="batch size (used as fixed batch if dynamic=False)")
-    parser.add_argument("--dynamic", default=True, action="store_true", help="whether the input shape should be dynamic or not")
+    # 👇 修复：默认关闭动态维度（RKNN 友好），加 --dynamic 才开启
+    parser.add_argument("--dynamic", default=False, action="store_true", help="whether the input shape should be dynamic or not")
     parser.add_argument("--no-onnxsim", action="store_true", help="use onnxsim or not")
     parser.add_argument("-f", "--exp_file", default=None, type=str, help="experiment description file")
     parser.add_argument("-expn", "--experiment-name", type=str, default=None)
@@ -76,6 +77,7 @@ def main():
     logger.info("loading checkpoint done.")
     dummy_input = torch.randn(args.batch_size, exp.img_channel, exp.test_size[0], exp.test_size[1])
 
+    # 👇 保留动态/静态切换逻辑
     dynamic_axes = {args.input: {0: 'batch'}, args.output: {0: 'batch'}} if args.dynamic else None
 
     torch.onnx.export(
@@ -93,10 +95,12 @@ def main():
         import onnx
         from onnxsim import simplify
 
+        # 👇 修复核心：静态模式强制固定输入形状，动态模式保持不变
         if args.dynamic:
             input_shapes = None
         else:
-            input_shapes = {args.input: list(dummy_input.shape)}
+            # 静态模式：RKNN 必须固定输入形状，彻底消除动态维度
+            input_shapes = {args.input: [args.batch_size, exp.img_channel, exp.test_size[0], exp.test_size[1]]}
 
         onnx_model = onnx.load(args.output_name)
         model_simp, check = simplify(onnx_model, overwrite_input_shapes=input_shapes)

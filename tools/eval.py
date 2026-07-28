@@ -7,7 +7,16 @@ import os
 import random
 import warnings
 from loguru import logger
-
+import sys
+# 获取当前文件所在目录的绝对路径
+current_dir = os.path.dirname(os.path.abspath(__file__))
+# 将当前目录添加到系统路径
+sys.path.append(current_dir)
+print("current_dir:", current_dir)
+# 获取祖父目录
+grandparent_dir = os.path.dirname(current_dir)
+print("grandparent_dir:", grandparent_dir)
+sys.path.append(grandparent_dir)
 import torch
 import torch.backends.cudnn as cudnn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -26,7 +35,7 @@ from yolox.utils import (
 
 def make_parser():
     parser = argparse.ArgumentParser("YOLOX Eval")
-    parser.add_argument("-expn", "--experiment-name", type=str, default=None)
+    parser.add_argument("-log_path", "--log-path", type=str, default=None)
     parser.add_argument("-n", "--name", type=str, default=None, help="model name")
 
     # distributed
@@ -59,7 +68,7 @@ def make_parser():
     parser.add_argument("-c", "--ckpt", default=None, type=str, help="ckpt for eval")
     parser.add_argument("--conf", default=None, type=float, help="test conf")
     parser.add_argument("--nms", default=None, type=float, help="test nms threshold")
-    parser.add_argument("--tsize", default=None, type=int, help="test img size")
+    parser.add_argument("--tsize", default=None, type=str, help="test img size")
     parser.add_argument("--seed", default=None, type=int, help="eval seed")
     parser.add_argument(
         "--fp16",
@@ -130,24 +139,24 @@ def main(exp, args, num_gpu):
 
     rank = get_local_rank()
 
-    file_name = os.path.join(exp.output_dir, args.experiment_name)
+    log_file_name = args.log_path # os.path.join(exp.output_dir, args.experiment_name)
 
-    if rank == 0:
-        os.makedirs(file_name, exist_ok=True)
+    # if rank == 0:
+    #     os.makedirs(log_file_name, exist_ok=True)
 
-    setup_logger(file_name, distributed_rank=rank, filename="val_log.txt", mode="a")
+    setup_logger(log_file_name, distributed_rank=rank, filename=log_file_name.split("/")[-1], mode="a")
     logger.info("Args: {}".format(args))
-
+    logger.info("log file is saved to {}".format(log_file_name))
     if args.conf is not None:
         exp.test_conf = args.conf
     if args.nms is not None:
         exp.nmsthre = args.nms
     if args.tsize is not None:
-        exp.test_size = (args.tsize, args.tsize)
+        exp.test_size = (int(args.tsize.split(",")[0]), int(args.tsize.split(",")[1]))
 
     model = exp.get_model()
     logger.info("Model Summary: {}".format(get_model_info(model, exp.test_size)))
-    logger.info("Model Structure:\n{}".format(str(model)))
+    # logger.info("Model Structure:\n{}".format(str(model)))
 
     evaluator = exp.get_evaluator(args.batch_size, is_distributed, args.test, args.legacy)
     evaluator.per_class_AP = True
@@ -202,8 +211,8 @@ if __name__ == "__main__":
     exp = get_exp(args.exp_file, args.name)
     exp.merge(args.opts)
 
-    if not args.experiment_name:
-        args.experiment_name = exp.exp_name
+    # if not args.experiment_name:
+    #     args.experiment_name = exp.exp_name
 
     num_gpu = torch.cuda.device_count() if args.devices is None else args.devices
     assert num_gpu <= torch.cuda.device_count()

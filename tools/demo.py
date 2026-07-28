@@ -23,7 +23,7 @@ import numpy as np
 from yolox.data.data_augment import ValTransform
 from yolox.data.datasets import BBOX_CLASSES, PLATE_CLASSES
 from yolox.exp import get_exp
-from yolox.utils import fuse_model, get_model_info, postprocess, vis
+from yolox.utils import fuse_model, get_model_info, load_ckpt, postprocess, vis
 import torch.nn.functional as F
 IMG_BOARDER = 100
 from typing import Tuple
@@ -86,6 +86,10 @@ def make_parser():
         type=str,
         help="device to run our model, can either be cpu or gpu",
     )
+    # ===================== 新增：指定GPU ID参数 =====================
+    parser.add_argument("--gpuid", type=int, default=0, 
+                        help="specify gpu id to use, only valid when device is gpu")
+    # ==============================================================
     parser.add_argument("--conf", default=0.3, type=float, help="test conf")
     parser.add_argument("--nms", default=0.3, type=float, help="test nms threshold")
     parser.add_argument("--tsize", default=None, type=int, help="test img size")
@@ -597,10 +601,13 @@ def main(exp, args):
     exp.decode_in_inference = True
     model = exp.get_model()
 
+    # ===================== 新增：绑定指定GPU =====================
     if args.device == "gpu":
+        torch.cuda.set_device(args.gpuid)  # 锁定使用的GPU
         model.cuda()
         if args.fp16:
             model.half()  # to FP16
+    # ============================================================
     if exp.model_name == 'yolov7_tiny':
         model.fuse()
     model.eval()
@@ -612,7 +619,9 @@ def main(exp, args):
             ckpt_file = args.ckpt
         logger.info("loading checkpoint")
         ckpt = torch.load(ckpt_file, map_location="cpu")
-        model.load_state_dict(ckpt["model"])
+        # load_ckpt 按 name+shape 过滤后 strict=False 加载，兼容 QAT ckpt：
+        # QAT ckpt 含额外的 *_fake_quant.* 参数，会被自动跳过，只加载浮点权重。
+        model = load_ckpt(model, ckpt["model"])
         logger.info("loaded checkpoint done.")
 
     if args.fuse:

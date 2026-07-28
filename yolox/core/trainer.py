@@ -49,14 +49,17 @@ class Trainer:
 
         # training related attr
         self.max_epoch = exp.max_epoch
-        self.amp_training = args.fp16
-        self.scaler = torch.cuda.amp.GradScaler(enabled=args.fp16)
+        self.qat = getattr(args, 'qat', False)
+        self.no_eval = getattr(args, 'no_eval', False)
+        self.amp_training = args.fp16 and not self.qat  # QAT 与 AMP 互斥
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp_training)
         self.is_distributed = get_world_size() > 1
         self.rank = get_rank()
         self.local_rank = get_local_rank()
         self.device = "cuda:{}".format(self.local_rank)
         self.use_model_ema = exp.ema
         self.save_history_ckpt = exp.save_history_ckpt
+        self.save_history_ckpt_interval = exp.save_history_ckpt_interval
 
         # data/dataloader related attr
         self.data_type = torch.float16 if args.fp16 else torch.float32
@@ -120,7 +123,14 @@ class Trainer:
 
         # with torch.cuda.amp.autocast(enabled=self.amp_training):
         with torch.amp.autocast('cuda', enabled=self.amp_training):
-            outputs, seg_output = self.model(inps, targets, seg_targets)  #
+            if self.qat:
+                # QAT: prepared GraphModule returns raw per-scale outputs,
+                # compute loss eagerly via decode + head loss functions
+                from yolox.utils.quant_utils import compute_qat_loss
+                raw_outputs = self.model(inps)
+                outputs = compute_qat_loss(self.head_module, raw_outputs, inps, targets, seg_targets)
+            else:
+                outputs, seg_output = self.model(inps, targets, seg_targets)  #
 
         loss = outputs["total_loss"]
 
@@ -158,6 +168,26 @@ class Trainer:
         except:
             pass
         model.to(self.device)
+
+        # QAT prepare: insert fake-quant via FX graph-mode QAT (before optimizer)
+        if self.qat:
+            # For QAT with a pretrained float ckpt: load BEFORE prepare so
+            # that key names match the base YOLOX model (not GraphModule).
+            if self.args.ckpt and not self.args.resume:
+                logger.info("QAT: loading pretrained weights before prepare...")
+                ckpt = torch.load(self.args.ckpt, map_location=self.device)
+                ckpt_sd = ckpt["model"] if "model" in ckpt else ckpt
+                load_ckpt(model, ckpt_sd)
+                self.start_epoch = 0
+                self._qat_pretrained_loaded = True
+
+            from yolox.utils.quant_utils import prepare_qat_model
+            # Keep the original YOLOXHead (with strides/get_output_and_grid/get_losses)
+            # for eager loss computation. The GraphModule's .head loses these methods.
+            self.qat_head = model.head
+            model = prepare_qat_model(model, self.exp, backend='qnnpack')
+            model.to(self.device)
+            logger.info("QAT model prepared, fake-quant active.")
 
         # solver related init
         self.optimizer = self.exp.get_optimizer(self.args.batch_size)
@@ -220,6 +250,34 @@ class Trainer:
         logger.info("Training start...")
         # logger.info("\n{}".format(model))
 
+    @property
+    def head_module(self):
+        """Get the underlying YOLOXHead, handling DDP wrapping and QAT.
+
+        In QAT mode, self.model is a GraphModule whose .head is a plain Module
+        (methods like get_output_and_grid/get_losses lost during tracing), so
+        return the saved original YOLOXHead (self.qat_head) for loss computation.
+        """
+        if self.qat:
+            return self.qat_head
+        model = self.model.module if is_parallel(self.model) else self.model
+        return model.head
+
+    def get_qat_eval_model(self):
+        """Return a QATEvalWrapper that adapts the QAT model for the COCO evaluator.
+
+        Wraps either the EMA copy (self.ema_model.ema) or the live prepared
+        GraphModule (self.model), both of which share the same fake-quantized
+        weights as training. The wrapper assembles the raw 12 per-scale outputs
+        into the eval [B, N, C] layout and exposes head.decode_outputs.
+        """
+        from yolox.utils.quant_utils import QATEvalWrapper
+        if self.use_model_ema:
+            prepared = self.ema_model.ema
+        else:
+            prepared = self.model.module if is_parallel(self.model) else self.model
+        return QATEvalWrapper(prepared, self.qat_head)
+
     def after_train(self):
         logger.info(
             "Training of experiment is done and the best AP is {:.2f}".format(self.best_ap * 100)
@@ -227,6 +285,20 @@ class Trainer:
         if self.rank == 0:
             if self.args.logger == "wandb":
                 self.wandb_logger.finish()
+
+            if self.qat:
+                # Convert trained QAT model and export ONNX with QDQ nodes
+                from yolox.utils.quant_utils import convert_and_export_qat
+                qat_onnx_path = os.path.join(self.file_name, "qat_best.onnx")
+                ema_model = self.ema_model.ema
+                logger.info("QAT: converting and exporting ONNX with QDQ nodes...")
+                convert_and_export_qat(
+                    ema_model, self.exp,
+                    output_name=qat_onnx_path,
+                    opset=19,
+                    no_onnxsim=True,
+                )
+                logger.info("QAT ONNX saved to: {}".format(qat_onnx_path))
 
     #### 负责根据epoch数量来切换数据增强和微调设置 ####
     def before_epoch(self):
@@ -236,10 +308,7 @@ class Trainer:
             logger.info("--->No mosaic aug now!")
             self.train_loader.close_mosaic()
             logger.info("--->Add additional L1 loss now!")
-            if self.is_distributed:
-                self.model.module.head.use_l1 = True
-            else:
-                self.model.head.use_l1 = True
+            self.head_module.use_l1 = True
             self.exp.eval_interval = 1
             if not self.no_aug:
                 self.save_ckpt(ckpt_name="last_mosaic_epoch")
@@ -252,6 +321,9 @@ class Trainer:
 
     def after_epoch(self):
         self.save_ckpt(ckpt_name="latest")
+
+        if self.no_eval:
+            return
 
         if (self.epoch + 1) % self.exp.eval_interval == 0:
             all_reduce_norm(self.model)
@@ -332,10 +404,6 @@ class Trainer:
                 ckpt_file = self.args.ckpt
 
             ckpt = torch.load(ckpt_file, map_location=self.device)
-            # # resume the model/optimizer state dict
-            # model.load_state_dict(ckpt["model"])
-            # self.optimizer.load_state_dict(ckpt["optimizer"])
-
             # -------------------------- 处理模型参数加载 --------------------------
             model_state_dict = model.state_dict()
             pretrained_model_dict = ckpt["model"]
@@ -348,11 +416,15 @@ class Trainer:
             model.load_state_dict(filtered_model_dict, strict=False)
             logger.info("Loaded model weights (unmatched parameters skipped)")
             # -------------------------- 处理模型参数加载 END--------------------------
+            # # resume the model/optimizer state dict
+            # model.load_state_dict(ckpt["model"])
+            self.optimizer.load_state_dict(ckpt["optimizer"])
 
-            self.best_ap = ckpt.pop("best_ap", 0)
-            logger.info(f"Best ap from pretrain is {self.best_ap:.4f}")
+            # 重置最佳AP，避免预训练模型的AP锁死后续保存
             self.best_ap = 0
-            logger.info(f"Best ap reset to {self.best_ap:.4f}")
+            self.kp_best_ap = 0
+            logger.info("Best AP/KP_AP have been reset to 0 for resume training.")
+
             # resume the training states variables
             start_epoch = (
                 self.args.start_epoch - 1
@@ -399,7 +471,11 @@ class Trainer:
         return metrics
 
     def evaluate_and_save_model(self):
-        if self.use_model_ema:
+        if self.qat:
+            # QAT mode: wrap the prepared GraphModule so the COCO evaluator
+            # sees the eval [B, N, C] layout and can call head.decode_outputs.
+            evalmodel = self.get_qat_eval_model()
+        elif self.use_model_ema:
             evalmodel = self.ema_model.ema
         else:
             evalmodel = self.model
@@ -455,8 +531,8 @@ class Trainer:
         # synchronize()
         # update_best_ckpt, ap50_95 = False, None
         self.save_ckpt("last_epoch", update_best_ckpt, ap=ap50_95, kp_ap50_95=kp_ap50_95)
-        if self.save_history_ckpt:
-            self.save_ckpt(f"epoch_{self.epoch + 1}", ap=ap50_95, kp_ap50_95=kp_ap50_95)
+        if self.save_history_ckpt and self.epoch % self.save_history_ckpt_interval == 0:
+            self.save_ckpt(f"epoch_{self.epoch}", ap=ap50_95, kp_ap50_95=kp_ap50_95)
 
     def save_ckpt(self, ckpt_name, update_best_ckpt=False, ap=None, kp_ap50_95=None):
         if self.rank == 0:

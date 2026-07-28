@@ -10,7 +10,7 @@ from loguru import logger
 from tqdm import tqdm
 import torch
 import torchvision
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'   # 只使用第1块GPU
+# os.environ['CUDA_VISIBLE_DEVICES'] = '2'   # 只使用第1块GPU
 
 # 常量定义
 BBOX_CLASSES = (
@@ -177,11 +177,24 @@ def get_video_list(path):
         for f in files:
             if f.lower().endswith('.mp4'):
                 video_paths.append(os.path.join(root, f))
+    video_paths.sort()  # 原地排序，保证顺序一致
     return video_paths
 
 class ONNXPredictor:
-    def __init__(self, onnx_path, input_size=(384, 640), num_classes=5, conf_thre=0.3, nms_thre=0.3, keypoints=False):
-        self.session = ort.InferenceSession(onnx_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    def __init__(self, onnx_path, input_size=(384, 640), num_classes=5, conf_thre=0.3, nms_thre=0.3, keypoints=False, gpu_id=0):
+        # self.session = ort.InferenceSession(onnx_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+        # 核心：指定GPU
+        providers = [
+            ("CUDAExecutionProvider", {"device_id": gpu_id}),
+            "CPUExecutionProvider"
+        ]
+        # 创建推理会话
+        self.session = ort.InferenceSession(
+            onnx_path,
+            providers=providers
+        )
+        # 验证GPU
+        print(f"推理引擎: {self.session.get_providers()}")
         self.input_name = self.session.get_inputs()[0].name
         self.input_size = input_size
         self.num_classes = num_classes
@@ -384,6 +397,24 @@ def process_one_video(video_path, predictor, args):
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     new_w = w + 2*IMG_BOARDER
     new_h = h + 2*IMG_BOARDER
+    # ----- 添加视频异常判断逻辑开始 -----
+    # 1. 检查帧宽高
+    if w <= 0 or h <= 0:
+        logger.error(f"视频尺寸异常 (宽={w}, 高={h})，可能已损坏: {video_path}")
+        cap.release()
+        return
+
+    # 2. 检查总帧数（常见损坏会返回0或极大负数）
+    # 典型的异常值如 -9223372036854775808 (LLONG_MIN)
+    if total_frames <= 0:
+        logger.error(f"视频总帧数异常 (total_frames={total_frames})，可能已损坏: {video_path}")
+        cap.release()
+        return
+
+    # 3. 检查帧率（非严格必要，但可作为辅助判断）
+    if fps <= 0 or fps > 1000:  # 过大或非正数
+        logger.warning(f"视频帧率异常 (fps={fps})，将使用默认值30: {video_path}")
+        fps = 30.0  # 或保留原值继续，取决于需求
 
     # 准备结果视频写入器
     vid_writer = None
@@ -422,9 +453,10 @@ def process_one_video(video_path, predictor, args):
                             phone_detected[idx] = True
                         if 3 in cls_ids:
                             smoke_detected[idx] = True
-                    res_frame = predictor.visual(out, frm, draw_kp=args.keypoints, draw_cls=target_cls)
                     if vid_writer is not None:
+                        res_frame = predictor.visual(out, frm, draw_kp=args.keypoints, draw_cls=target_cls)
                         vid_writer.write(res_frame)
+                pbar.update(len(frames_batch))
             break
 
         frames_batch.append(frame)
@@ -441,14 +473,13 @@ def process_one_video(video_path, predictor, args):
                         phone_detected[idx] = True
                     if 3 in cls_ids:
                         smoke_detected[idx] = True
-                res_frame = predictor.visual(out, frm, draw_kp=args.keypoints, draw_cls=target_cls)
                 if vid_writer is not None:
+                    res_frame = predictor.visual(out, frm, draw_kp=args.keypoints, draw_cls=target_cls)
                     vid_writer.write(res_frame)
             frames_batch = []
             indices_batch = []
             pbar.update(batch_size)
-        else:
-            pbar.update(1)  # 不足 batch 时也更新进度
+
 
     pbar.close()
     cap.release()
@@ -512,7 +543,7 @@ def make_parser():
     parser.add_argument("--save_result", action="store_true", help="save output video")
     parser.add_argument("--draw_cls", default=None, type=str, 
                         help="只绘制指定类别，可选：Person, Seatbelt, Face, Smoking, Phone")
-
+    parser.add_argument("--gpu_id", default=0, type=int, help="GPU ID for ONNX Runtime (default: 0)")
     # 错误分析相关参数
     parser.add_argument("--error_analysis", action="store_true", help="perform false positive/negative analysis and save frames")
     parser.add_argument("--loujian_root", default="/home/liuyc/workspace/dataset/LouJian", help="root dir for false negatives (漏检)")
@@ -535,7 +566,8 @@ def main():
         input_size=(384, 640),
         conf_thre=args.conf,
         nms_thre=args.nms,
-        keypoints=args.keypoints
+        keypoints=args.keypoints,
+        gpu_id=args.gpu_id
     )
 
     if args.demo == "image":
@@ -560,6 +592,7 @@ def main():
             for idx, vpath in enumerate(video_list, start=1):
                 percent = idx / total_videos * 100
                 logger.info(f"正在处理视频 [{idx}/{total_videos}] ({percent:.1f}%): {vpath}")
+                # if "Smoke_20250331_202209_D18777D_73" in vpath:
                 process_one_video(vpath, predictor, args)
         else:
             process_one_video(args.path, predictor, args)

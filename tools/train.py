@@ -7,7 +7,7 @@ import random
 import warnings
 from loguru import logger
 import os
-os.environ['CUDA_VISIBLE_DEVICES']='1'
+os.environ['CUDA_VISIBLE_DEVICES']='2'
 
 import sys
 # 获取当前文件所在目录的绝对路径
@@ -100,6 +100,22 @@ def make_parser():
         default="tensorboard"
     )
     parser.add_argument(
+        "--qat",
+        dest="qat",
+        default=False,
+        action="store_true",
+        help="Enable QAT (Quantization-Aware Training) for RKNN deployment. "
+             "Mutually exclusive with --fp16 (AMP disabled under QAT).",
+    )
+    parser.add_argument(
+        "--no-eval",
+        dest="no_eval",
+        default=False,
+        action="store_true",
+        help="Disable COCO evaluation during training (much faster; "
+             "best_ckpt will not be tracked by AP).",
+    )
+    parser.add_argument(
         "opts",
         help="Modify config options using the command-line",
         default=None,
@@ -110,6 +126,13 @@ def make_parser():
 
 @logger.catch
 def main(exp: Exp, args):
+    if args.qat and args.fp16:
+        logger.warning(
+            "QAT is enabled: --fp16 is incompatible with fake-quant and has been "
+            "forced off. Training will run in fp32."
+        )
+        args.fp16 = False
+
     if exp.seed is not None:
         random.seed(exp.seed)
         torch.manual_seed(exp.seed)
