@@ -324,6 +324,8 @@ class COCOEvaluator:
         testdev: bool = False,
         per_class_AP: bool = False,
         per_class_AR: bool = False,
+        keypoints: int = 4,
+        per_keypoint_tables: bool = False,
     ):
         """
         Args:
@@ -335,6 +337,10 @@ class COCOEvaluator:
             nmsthre: IoU threshold of non-max supression ranging from 0 to 1.
             per_class_AP: Show per class AP during evalution or not. Default to False.
             per_class_AR: Show per class AR during evalution or not. Default to False.
+            keypoints: 关键点数量。0 表示纯检测模式：后处理/转换/评估
+                全部跳过关键点分支（模型输出也不含关键点列）。
+            per_keypoint_tables: 是否计算 per-(class, keypoint) AP/AR 表。
+                纯 Python 实现，对整个验证集做 OKS 匹配，非常慢，训练时建议关闭。
         """
         self.dataloader = dataloader
         self.img_size = img_size
@@ -344,6 +350,8 @@ class COCOEvaluator:
         self.testdev = testdev
         self.per_class_AP = per_class_AP
         self.per_class_AR = per_class_AR
+        self.keypoints = keypoints
+        self.per_keypoint_tables = per_keypoint_tables
 
     def evaluate(
         self,
@@ -437,8 +445,9 @@ class COCOEvaluator:
                     "input_w": self.img_size[1],
                 }
                 outputs = postprocess(
-                    outputs, letterbox_info, self.num_classes, self.confthre, self.nmsthre, class_agnostic=False, keypoints=True
-                )   # (N, 19) 5+1+1+12
+                    outputs, letterbox_info, self.num_classes, self.confthre, self.nmsthre,
+                    class_agnostic=False, keypoints=self.keypoints > 0
+                )   # 关键点模式 (N, 19) 5+1+1+12；纯检测模式 (N, 7) 5+1+1
                 if is_time_record:
                     nms_end = time_synchronized()
                     nms_time += nms_end - infer_end
@@ -465,7 +474,6 @@ class COCOEvaluator:
             output = output.cpu()
 
             bboxes = output[:, 0:4]
-            keypoints = output[:, 7:19]
             # preprocessing: resize
             scale = min(
                 self.img_size[0] / float(img_h), self.img_size[1] / float(img_w)
@@ -474,15 +482,19 @@ class COCOEvaluator:
             bboxes /= scale
             bboxes = xyxy2xywh(bboxes)
 
-            raw_kpts = keypoints.cpu().numpy().reshape(-1, 4, 3)
-            # x, y 缩放
-            raw_kpts[..., 0] /= scale
-            raw_kpts[..., 1] /= scale
-            # score → visibility
-            # score > 0.6 → v = 1, else v = 0
-            # raw_kpts[..., 2] = (raw_kpts[..., 2] > 0.6).astype(np.float32)
-            # 再展平成 COCO 需要的一维格式
-            keypoints = raw_kpts.reshape(-1, 12)
+            if self.keypoints > 0:
+                # postprocess 输出布局: (x1,y1,x2,y2, obj, cls_conf, cls_id, kpts...)
+                # 关键点从第 7 列开始，共 3*K 列 (x, y, score)
+                keypoints = output[:, 7 : 7 + 3 * self.keypoints]
+                raw_kpts = keypoints.cpu().numpy().reshape(-1, self.keypoints, 3)
+                # x, y 缩放
+                raw_kpts[..., 0] /= scale
+                raw_kpts[..., 1] /= scale
+                # score → visibility
+                # score > 0.6 → v = 1, else v = 0
+                # raw_kpts[..., 2] = (raw_kpts[..., 2] > 0.6).astype(np.float32)
+                # 再展平成 COCO 需要的一维格式
+                keypoints = raw_kpts.reshape(-1, 3 * self.keypoints)
 
             cls = output[:, 6]
             scores = output[:, 4] * output[:, 5]
@@ -494,14 +506,15 @@ class COCOEvaluator:
                     "bbox": bboxes[ind].numpy().tolist(),
                     "score": scores[ind].numpy().item(),
                     "segmentation": [],
-                    "keypoints": keypoints[ind].tolist(),# 直接使用原始12列关键点（已含x/y/v，符合COCO格式）
                 }  # COCO json format
+                if self.keypoints > 0:
+                    pred_data["keypoints"] = keypoints[ind].tolist()  # 直接使用原始12列关键点（已含x/y/v，符合COCO格式）
                 data_list.append(pred_data)
         return data_list
 
     def evaluate_prediction(self, data_dict, statistics):
         if not is_main_process():
-            return 0, 0, None
+            return 0, 0, 0, 0, None
 
         logger.info("Evaluate in main process...")
 
@@ -557,18 +570,22 @@ class COCOEvaluator:
             info += bbox_info + "\n"
 
             # 2. 评估关键点（keypoints）
-            info += "="*50 + " Keypoints Evaluation " + "="*50 + "\n"
-            cocoEval_kp = COCOeval(cocoGt, cocoDt, annType[2])  # keypoints
-            # 定义4个关键点的oks方差
-            cocoEval_kp.setKpParams(kpt_oks_sigmas=KP_OKS_SIGMAS["Person"])
-            # 关键点评估：自动使用OKS阈值，适配4个关键点的数据集
-            cocoEval_kp.evaluate()
-            cocoEval_kp.accumulate()
-            redirect_string_kp = io.StringIO()
-            with contextlib.redirect_stdout(redirect_string_kp):
-                cocoEval_kp.summarize()
-            kp_info = redirect_string_kp.getvalue()
-            info += kp_info + "\n"
+            if self.keypoints > 0:
+                info += "="*50 + " Keypoints Evaluation " + "="*50 + "\n"
+                cocoEval_kp = COCOeval(cocoGt, cocoDt, annType[2])  # keypoints
+                # 定义4个关键点的oks方差
+                cocoEval_kp.setKpParams(kpt_oks_sigmas=KP_OKS_SIGMAS["Person"])
+                # 关键点评估：自动使用OKS阈值，适配4个关键点的数据集
+                cocoEval_kp.evaluate()
+                cocoEval_kp.accumulate()
+                redirect_string_kp = io.StringIO()
+                with contextlib.redirect_stdout(redirect_string_kp):
+                    cocoEval_kp.summarize()
+                kp_info = redirect_string_kp.getvalue()
+                info += kp_info + "\n"
+                kp_ap50_95, kp_ap50 = cocoEval_kp.stats[0], cocoEval_kp.stats[1]
+            else:
+                kp_ap50_95, kp_ap50 = 0.0, 0.0
 
             # 类别级评估（可选）
             info += "="*50 + " BBOX Evaluation (Per class) " + "="*50 + "\n"
@@ -581,9 +598,9 @@ class COCOEvaluator:
                 AR_table = per_class_AR_table(cocoEval_bbox, class_names=cat_names)
                 info += "BBOX per class AR:\n" + AR_table + "\n"
 
-            # 4. 单个关键点的AP/AR（新增核心功能）
-            info += "="*50 + " Keypoints Evaluation (Per Keypoint) " + "="*50 + "\n"
-            if self.per_class_AP:
+            # 4. 单个关键点的AP/AR（纯Python实现很慢，由 per_keypoint_tables 控制，训练时默认关闭）
+            if self.keypoints > 0 and self.per_keypoint_tables:
+                info += "="*50 + " Keypoints Evaluation (Per Keypoint) " + "="*50 + "\n"
                 kp_AP_table = per_keypoint_AP_table(
                     cocoGt=cocoGt,
                     cocoDt=cocoDt,
@@ -591,17 +608,16 @@ class COCOEvaluator:
                     oks_sigmas= KP_OKS_SIGMAS
                 )
                 info += "Keypoint per (class, keypoint) AP:\n" + kp_AP_table + "\n\n"
-            
-            if self.per_class_AR:
+
                 kp_AR_table = per_keypoint_AR_table(
                     cocoGt=cocoGt,
                     cocoDt=cocoDt,
                     keypoint_class_map=KEYPOINT_CLASSES,
                     oks_sigmas= KP_OKS_SIGMAS
                 )
-            info += "Keypoint per (class, keypoint) AR:\n" + kp_AR_table + "\n"
+                info += "Keypoint per (class, keypoint) AR:\n" + kp_AR_table + "\n"
 
             # 返回bbox AP、关键点AP、完整日志
-            return cocoEval_bbox.stats[0],cocoEval_bbox.stats[1], cocoEval_kp.stats[0], cocoEval_kp.stats[1], info
+            return cocoEval_bbox.stats[0], cocoEval_bbox.stats[1], kp_ap50_95, kp_ap50, info
         else:
             return 0, 0 ,0, 0, info

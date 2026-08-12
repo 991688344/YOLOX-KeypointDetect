@@ -48,6 +48,13 @@ class YOLOXHead(nn.Module):
         self.decode_in_inference = decode_in_inference  # for deploy, set to False
         self.model_export = model_export
 
+        # 减少标签分配中的 CPU↔GPU 同步（数值与逐 GT/逐图同步版本完全一致）。
+        # 置 False 可回退到原始路径做 A/B 对比。
+        self.reduce_sync = True
+        # True 时训练不计算关键点 loss（kp 头 forward 照跑，ONNX 输出结构不变，
+        # 但 kp 参数无梯度 ≈ 冻结）。用于只关心检测框、不想改板端推理的场景。
+        self.disable_kp_loss = False
+
         self.cls_convs = nn.ModuleList()
         self.reg_convs = nn.ModuleList()
         self.seg_convs = nn.ModuleList()
@@ -404,8 +411,10 @@ class YOLOXHead(nn.Module):
         num_fg = 0.0
         num_gts = 0.0
         batch_size, _, self.im_h, self.im_w = imgs.shape
+        if self.reduce_sync:
+            nlabel_list = nlabel.tolist()  # 1 次同步，代替逐图 int(nlabel[i])
         for batch_idx in range(outputs.shape[0]):
-            num_gt = int(nlabel[batch_idx])
+            num_gt = nlabel_list[batch_idx] if self.reduce_sync else int(nlabel[batch_idx])
             num_gts += num_gt
             if num_gt == 0:
                 cls_target = outputs.new_zeros((0, self.num_classes))
@@ -485,8 +494,13 @@ class YOLOXHead(nn.Module):
                         "cpu",
                     )
 
-                torch.cuda.empty_cache()
-                num_fg += num_fg_img    # 2
+                if not self.reduce_sync:
+                    torch.cuda.empty_cache()
+                if self.reduce_sync:
+                    # 保持张量累加，到 get_losses 末尾统一同步（省掉逐图 .item()）
+                    num_fg = num_fg + num_fg_img if torch.is_tensor(num_fg) else num_fg_img
+                else:
+                    num_fg += num_fg_img    # 2
                 if self.segcls > 0:
                     cls_targets_ls.append(gt_matched_classes)
                 cls_target = F.one_hot(         # [2, 2]
@@ -531,6 +545,17 @@ class YOLOXHead(nn.Module):
         if self.use_l1:
             l1_targets = torch.cat(l1_targets, 0)
 
+        if self.reduce_sync:
+            if torch.is_tensor(num_fg):
+                # DDP：跨 rank 求和取均值，对齐各 rank 的 loss 归一化分母
+                # （与上游 YOLOX 行为一致；world_size=1 时为 no-op）
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    num_fg = num_fg.clone()
+                    torch.distributed.all_reduce(num_fg)
+                    num_fg = num_fg / torch.distributed.get_world_size()
+                num_fg = int(num_fg.item())  # 整 iter 仅此一次 GPU→CPU 同步
+            else:
+                num_fg = int(num_fg)  # 全 batch 无 GT 时 simota 早退返回的 int
         num_fg = max(num_fg, 1)
         loss_iou = (
                        self.iou_loss(bbox_preds.view(-1, 4)[fg_masks], reg_targets) # [4, 5040, 4] --> [20160, 4][fg_masks] --> [15, 4]
@@ -543,7 +568,7 @@ class YOLOXHead(nn.Module):
                            cls_preds.view(-1, self.num_classes)[fg_masks], cls_targets
                        )
                    ).sum() / num_fg
-        if self.keypoints > 0:
+        if self.keypoints > 0 and not self.disable_kp_loss:
             loss_kpts, loss_kpts_vis = self.kpts_loss(  # [15, 12], [15, 8], [15, 4]
                 lmk_preds.view(-1, self.keypoints * 3)[fg_masks], lmk_targets, reg_targets) # lmk_preds [4, 5040, 12] -- > [20160, 12] --> [15, 12]
             loss_lmk = 5.0 * loss_kpts.sum() / num_fg + loss_kpts_vis.sum() / num_fg
@@ -896,20 +921,33 @@ class YOLOXHead(nn.Module):
         # -------------------------
         # 2. 对每个 GT 匹配 top-k anchors（安全 topk）
         # -------------------------
-        for gt_idx in range(num_gt):
+        if self.reduce_sync:
+            # 向量化逐 GT topk 循环：所有 GT 的 cost 长度 M 相同，
+            # clamp(max=M) ≡ 逐行 min(k, numel)；每行取 cost 最小的前 ks[g] 个 anchor。
+            # 匹配结果与原循环逐位一致（唯一理论差异是等值 cost 的 tie-break 选择，
+            # 连续 cost 下不会出现）。
+            M = cost.size(1)
+            ks = dynamic_ks.clamp(max=M)
+            k_max = int(ks.max())  # 整图仅 1 次同步（代替逐 GT 的 .item()）
+            _, topk_idx = torch.topk(cost, k_max, dim=1, largest=False)
+            keep = torch.arange(k_max, device=cost.device)[None, :] < ks[:, None]
+            matching_matrix.scatter_(1, topk_idx, keep.to(matching_matrix.dtype))
+            del topk_ious, dynamic_ks
+        else:
+            for gt_idx in range(num_gt):
 
-            # 当前 gt 的 cost 向量为空
-            if cost[gt_idx].numel() == 0:
-                continue
+                # 当前 gt 的 cost 向量为空
+                if cost[gt_idx].numel() == 0:
+                    continue
 
-            # 获取 k，不能超过 anchor 数
-            k = min(dynamic_ks[gt_idx].item(), cost[gt_idx].numel())
+                # 获取 k，不能超过 anchor 数
+                k = min(dynamic_ks[gt_idx].item(), cost[gt_idx].numel())
 
-            # 执行安全 topk
-            _, pos_idx = torch.topk(cost[gt_idx], k=k, largest=False)
-            matching_matrix[gt_idx][pos_idx] = 1
+                # 执行安全 topk
+                _, pos_idx = torch.topk(cost[gt_idx], k=k, largest=False)
+                matching_matrix[gt_idx][pos_idx] = 1
 
-        del topk_ious, dynamic_ks, pos_idx
+            del topk_ious, dynamic_ks, pos_idx
 
         # -------------------------
         # 3. 处理 anchor 多重匹配
@@ -927,7 +965,9 @@ class YOLOXHead(nn.Module):
             matching_matrix[cost_argmin, multiple_match_mask] = 1
 
         fg_mask_inboxes = anchor_matching_gt > 0
-        num_fg = fg_mask_inboxes.sum().item()
+        num_fg = fg_mask_inboxes.sum()
+        if not self.reduce_sync:
+            num_fg = num_fg.item()
 
         # ----------- copy 回 fg_mask（YOLOX 原始逻辑）---------
         fg_mask[fg_mask.clone()] = fg_mask_inboxes

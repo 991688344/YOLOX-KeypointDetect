@@ -33,6 +33,33 @@ def augment_hsv(img, hgain=0.015, sgain=0.7, vgain=0.4):
     cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)  # no return needed
 
 
+def add_gaussian_noise(img, sigma=4.0):
+    """高斯加性噪声，作用在 [0,255] float 图像上（HWC/CHW 均可），输出裁剪到 [0,255]。
+
+    与 eye 分类项目参数一致：sigma=4.0 在 [0,255] 域 ≈ 归一化域的 0.016，非常温和。
+    本管线 preproc 后图像为 float32 [0,255]（不除以 255），故 sigma 按 [0,255] 域取值。
+    """
+    noise = np.random.randn(*img.shape) * sigma
+    return np.clip(img + noise, 0, 255).astype(np.float32)
+
+
+def add_salt_pepper(img, p=0.004, salt_vs_pepper=0.5):
+    """椒盐噪声，作用在 [0,255] float32 CHW 图像上。
+
+    p: 被污染像素比例（每个空间位置一次随机，三通道共享掩码，模拟真实 sensor 坏点）；
+    salt_vs_pepper: 污染像素中盐噪(255)的占比，其余为椒噪(0)。
+    p=0.004 时 640x384 图约 983 像素/通道被污染，视觉上几乎不可察觉。
+    """
+    h, w = img.shape[1], img.shape[2]
+    mask = np.random.rand(h, w)
+    salt = mask < p * salt_vs_pepper
+    pepper = (mask >= p * salt_vs_pepper) & (mask < p)
+    out = img.copy()
+    out[:, salt] = 255.0   # 盐噪置 255
+    out[:, pepper] = 0.0   # 椒噪置 0
+    return out
+
+
 def box_candidates(box1, box2, wh_thr=2, ar_thr=20, area_thr=0.2):
     # box1(4,n), box2(4,n)
     # Compute candidate boxes which include follwing 5 things:计算候选框，包括以下5项

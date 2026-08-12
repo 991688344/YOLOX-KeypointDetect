@@ -43,7 +43,7 @@ class Exp(MyExp):
         self.model_name = 'yolo_pafpn'
         self.repeat = 2
         self.decode_in_inference = False
-        self.data_num_workers = 6
+        self.data_num_workers = 16
         self.input_size = (384, 640)  # (height, width)
         self.multiscale_range = 5
 
@@ -59,8 +59,8 @@ class Exp(MyExp):
         self.cate_ls, self.mask_order, self.cate_id = [], [], []
 
         self.data_dir = 'datasets/YaXon_DMS_OD_Keypoint'
-        self.train_ann = "person_keypoints_train2017.json"
-        self.val_ann = "person_keypoints_val2017.json"
+        self.train_ann = "person_keypoints_train2017.json" # person_keypoints_train2017_512
+        self.val_ann = "person_keypoints_val2017.json"  # person_keypoints_val2017_256
         self.finetuning_train_ann = "person_keypoints_train2017.json"  # 微调数据集标签
         # --------------- transform config ----------------- #
         self.mosaic_prob = 0.4#
@@ -80,9 +80,9 @@ class Exp(MyExp):
         # self.max_epoch = 1300
         self.warmup_lr = 0
         self.adam = False
-        self.basic_lr_per_img = 0.001 / 32.0 if self.adam else 0.01 / 32.0
+        self.basic_lr_per_img = 5e-6  # QAT训练  #0.001 / 32.0 if self.adam else 0.01 / 32.0
         self.scheduler = "yoloxwarmcos"
-        self.aug_epochs = 1500              # 数据增强训练轮次
+        self.aug_epochs = 1000              # 数据增强训练轮次
         self.no_aug_epochs = 300            # 非数据增强训练轮次
         self.finetuning_train_epoch = 0   # 微调数据集训练轮次
         self.max_epoch = self.aug_epochs + self.no_aug_epochs + self.finetuning_train_epoch     # 总训练轮次
@@ -94,6 +94,9 @@ class Exp(MyExp):
         self.momentum = 0.9
         self.print_interval = 10
         self.eval_interval = 10
+        self.no_aug_eval_interval = 5   # no-aug 阶段的评估间隔（trainer 之前强制为 1）
+        self.eval_per_kp = False        # 纯 Python 的 per-keypoint AP/AR 表很慢，训练时默认关闭；-o eval_per_kp True 开启
+        self.disable_kp_loss = False    # 训练时不计算关键点 loss：kp 头结构/输出/评估均不变（ONNX/板端不改），kp 参数无梯度 ≈ 冻结
         self.save_history_ckpt = False
         self.save_history_ckpt_interval = 100
         self.exp_name = os.path.split(os.path.realpath(__file__))[1].split(".")[0]
@@ -139,6 +142,8 @@ class Exp(MyExp):
                             repeat=self.repeat,
                             depthwise=True,
                             decode_in_inference = self.decode_in_inference)
+            # 把 kp loss 开关传给 head（只训检测框、保持 ONNX 结构/板端代码不变时用）
+            head.disable_kp_loss = getattr(self, "disable_kp_loss", False)
             self.model = YOLOX(backbone, head)
 
         self.model.apply(init_yolo)
@@ -211,7 +216,12 @@ class Exp(MyExp):
             mosaic=not no_aug,
         )
 
-        dataloader_kwargs = {"num_workers": self.data_num_workers, "pin_memory": self.pin_memory}
+        dataloader_kwargs = {
+            "num_workers": self.data_num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": True,
+            "prefetch_factor": 4,
+        }
         dataloader_kwargs["batch_sampler"] = batch_sampler
 
         # Make sure each process has different random seed, especially for 'fork' method.
@@ -288,7 +298,12 @@ class Exp(MyExp):
             mosaic=not no_aug,
         )
 
-        dataloader_kwargs = {"num_workers": self.data_num_workers, "pin_memory": self.pin_memory}
+        dataloader_kwargs = {
+            "num_workers": self.data_num_workers,
+            "pin_memory": self.pin_memory,
+            "persistent_workers": True,
+            "prefetch_factor": 4,
+        }
         dataloader_kwargs["batch_sampler"] = batch_sampler
 
         # Make sure each process has different random seed, especially for 'fork' method.
@@ -384,7 +399,7 @@ class Exp(MyExp):
         return scheduler
 
     def get_eval_loader(self, batch_size, is_distributed, testdev=False, legacy=False):
-        from yolox.data import COCODataset, ValTransform
+        from yolox.data import COCODataset, ValTransform, worker_init_reset_seed
 
         valdataset = COCODataset(
             data_dir=self.data_dir,
@@ -405,7 +420,10 @@ class Exp(MyExp):
         dataloader_kwargs = {
             "num_workers": self.data_num_workers,
             "pin_memory": self.pin_memory,
+            "persistent_workers": True,
+            "prefetch_factor": 4,
             "sampler": sampler,
+            "worker_init_fn": worker_init_reset_seed,
         }
         dataloader_kwargs["batch_size"] = batch_size
         val_loader = torch.utils.data.DataLoader(valdataset, **dataloader_kwargs)
@@ -425,6 +443,8 @@ class Exp(MyExp):
             testdev=testdev,
             per_class_AP = True,
             per_class_AR = True,
+            keypoints = self.keypoints,
+            per_keypoint_tables = self.eval_per_kp,
         )
         return evaluator
 

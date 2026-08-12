@@ -111,3 +111,8 @@ def worker_init_reset_seed(worker_id):
     random.seed(seed)
     torch.set_rng_state(torch.manual_seed(seed).get_state())
     np.random.seed(seed)
+    # 多 worker 数据增强时，每个 worker 进程固定 OpenCV/OMP 单线程，
+    # 避免 num_workers × OpenCV 线程数过度订阅 CPU（Linux 下默认未限制）
+    import cv2
+    cv2.setNumThreads(0)
+    os.environ["OMP_NUM_THREADS"] = "1"

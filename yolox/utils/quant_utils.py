@@ -16,7 +16,11 @@ import torch
 import torch.nn as nn
 from torch.ao.quantization.quantize_fx import prepare_qat_fx, convert_fx
 from torch.ao.quantization import QConfig, FakeQuantize
-from torch.ao.quantization.observer import MovingAverageMinMaxObserver, MovingAveragePerChannelMinMaxObserver
+from torch.ao.quantization.observer import (
+    MovingAverageMinMaxObserver,
+    MovingAveragePerChannelMinMaxObserver,
+    MinMaxObserver,
+)
 from loguru import logger
 
 
@@ -30,7 +34,8 @@ class TraceableYOLOXForQAT(nn.Module):
     Shares backbone and head references with the original YOLOX model,
     so training this wrapper updates the same underlying weights.
 
-    Output: tuple of 4*n_scales tensors for n_scales x 4 predictions:
+    Output: tuple of n_out*n_scales tensors, per scale (reg, obj, cls[, lmk]);
+      n_out = 4 when head.keypoints > 0 (adds lmk), else 3. E.g. keypoints:
       (reg_s8, obj_s8, cls_s8, lmk_s8,
        reg_s16, obj_s16, cls_s16, lmk_s16,
        reg_s32, obj_s32, cls_s32, lmk_s32)
@@ -53,12 +58,13 @@ class TraceableYOLOXForQAT(nn.Module):
             reg_feat = self.head.reg_convs[k](feat)
             reg_output = self.head.reg_preds[k](reg_feat)
             obj_output = self.head.obj_preds[k](reg_feat)
-            lmk_output = self.head.lmk_preds[k](reg_feat)
 
             outputs.append(reg_output)
             outputs.append(obj_output)
             outputs.append(cls_output)
-            outputs.append(lmk_output)
+            if self.head.keypoints > 0:
+                lmk_output = self.head.lmk_preds[k](reg_feat)
+                outputs.append(lmk_output)
 
         return tuple(outputs)
 
@@ -96,17 +102,19 @@ class QATEvalWrapper(nn.Module):
     def forward(self, x):
         raw = self.prepared(x)
         n_scales = len(self._qat_head.strides)
+        # 每个 scale 的输出数：keypoints>0 时 4 个（reg/obj/cls/lmk），否则 3 个
+        n_out = 4 if self._qat_head.keypoints > 0 else 3
         outputs = []
         hw = []
         for k in range(n_scales):
-            reg_output = raw[k * 4]
-            obj_output = raw[k * 4 + 1]
-            cls_output = raw[k * 4 + 2]
-            lmk_output = raw[k * 4 + 3]
-            # Eval layout (matches YOLOXHead eval branch): obj/cls sigmoid'd
-            output = torch.cat(
-                [reg_output, obj_output.sigmoid(), cls_output.sigmoid(), lmk_output], 1
-            )
+            reg_output = raw[k * n_out]
+            obj_output = raw[k * n_out + 1]
+            cls_output = raw[k * n_out + 2]
+            # Eval layout (matches YOLOXHead eval branch): obj/cls sigmoid'd, reg(/lmk) raw
+            parts = [reg_output, obj_output.sigmoid(), cls_output.sigmoid()]
+            if self._qat_head.keypoints > 0:
+                parts.append(raw[k * n_out + 3])  # lmk
+            output = torch.cat(parts, 1)
             outputs.append(output)
             hw.append(reg_output.shape[-2:])  # (H, W) per scale
         # The evaluator's decoder (head.decode_outputs) reads self.hw, which is
@@ -119,38 +127,52 @@ class QATEvalWrapper(nn.Module):
         return outputs
 
 
-def get_qat_qconfig(backend='qnnpack'):
+def get_qat_qconfig(backend='qnnpack', weight_quant='per_channel'):
     """Get QAT qconfig suitable for RKNN (ARM NPU).
 
     Args:
-        backend: 'qnnpack' (per-tensor asymmetric, ARM/RKNN-friendly)
+        backend: 'qnnpack' (per-tensor asymmetric activations, ARM/RKNN-friendly)
                  or 'fbgemm' (per-channel, x86 reference)
+        weight_quant: 'per_channel' (default) — per-channel symmetric int8,
+                      needs opset >= 13 for ONNX export.
+                      'per_tensor' — per-tensor symmetric int8, compatible
+                      with opset 12 (RV1126). Lower weight precision.
+
+    NOTE (2026-07-28): per_channel_affine (RKNN SDK recommended) breaks the
+    PyTorch QDQ→ONNX export path (constant conv outputs, zero detections).
+    per_channel_symmetric works on opset >= 13 but not opset 12 (DQ axis
+    attribute unsupported). per_tensor_symmetric works on opset 12.
     """
     if backend == 'qnnpack':
-        # Matches RKNN NPU's recommended qconfig (SDK V2.3.2 guide §120):
-        #   activation: uint8 per-tensor asymmetric (0~255), reduce_range=False
-        #   weight:     int8 per-channel affine (-128~127)
-        # per_channel_affine (not the default per_channel_symmetric) lets
-        # zero_point be non-zero, which RKNN hardware supports.
-        # reduce_range=False keeps the full -128~127 range (better accuracy).
-        qconfig = QConfig(
-            activation=FakeQuantize.with_args(
-                observer=MovingAverageMinMaxObserver,
-                quant_min=0,
-                quant_max=255,
-                dtype=torch.quint8,
-                qscheme=torch.per_tensor_affine,
-                reduce_range=False,
-            ),
-            weight=FakeQuantize.with_args(
-                observer=MovingAveragePerChannelMinMaxObserver,
-                quant_min=-128,
+        activation_fq = FakeQuantize.with_args(
+            observer=MovingAverageMinMaxObserver,
+            quant_min=0,
+            quant_max=255,
+            dtype=torch.quint8,
+            qscheme=torch.per_tensor_affine,
+            reduce_range=False,
+        )
+        if weight_quant == 'per_tensor':
+            # per-tensor symmetric weights: opset 12 compatible (scalar DQ)
+            weight_fq = FakeQuantize.with_args(
+                observer=MinMaxObserver,
+                quant_min=-127,
                 quant_max=127,
                 dtype=torch.qint8,
-                qscheme=torch.per_channel_affine,
+                qscheme=torch.per_tensor_symmetric,
                 reduce_range=False,
-            ),
-        )
+            )
+        else:
+            # per-channel symmetric weights: opset >= 13 required
+            weight_fq = FakeQuantize.with_args(
+                observer=MovingAveragePerChannelMinMaxObserver,
+                quant_min=-127,
+                quant_max=127,
+                dtype=torch.qint8,
+                qscheme=torch.per_channel_symmetric,
+                reduce_range=False,
+            )
+        qconfig = QConfig(activation=activation_fq, weight=weight_fq)
     else:
         from torch.ao.quantization import get_default_qat_qconfig
         qconfig = get_default_qat_qconfig(backend)
@@ -197,7 +219,7 @@ def _warmup_observer_shapes(prepared, example_input):
             m.num_batches_tracked.copy_(nbt)
 
 
-def prepare_qat_model(model, exp, backend='qnnpack'):
+def prepare_qat_model(model, exp, backend='qnnpack', weight_quant='per_channel'):
     """Prepare model for QAT using FX graph-mode quantization.
 
     Creates a traceable wrapper, runs prepare_qat_fx to insert fake-quant.
@@ -208,6 +230,7 @@ def prepare_qat_model(model, exp, backend='qnnpack'):
         model: YOLOX model (from exp.get_model())
         exp: experiment config (for test_size, img_channel)
         backend: 'qnnpack' for RKNN/ARM, 'fbgemm' for x86
+        weight_quant: 'per_channel' (opset>=13) or 'per_tensor' (opset 12)
 
     Returns:
         prepared: GraphModule with fake-quant (use for training forward)
@@ -220,7 +243,7 @@ def prepare_qat_model(model, exp, backend='qnnpack'):
 
     # qnnpack backend: supports depthwise (groups>1) conv, matches ARM/RKNN target
     torch.backends.quantized.engine = "qnnpack"
-    qconfig = get_qat_qconfig(backend)
+    qconfig = get_qat_qconfig(backend, weight_quant=weight_quant)
     # Quantize the whole graph, including the prediction heads. The ONNX
     # exporter emits QDQ nodes around the graph outputs regardless, so the
     # exported model is fully quantized either way — and with QAT training,
@@ -265,6 +288,8 @@ def compute_qat_loss(head, raw_outputs, imgs, targets, seg_targets=None):
         dict with 'total_loss' and individual loss components
     """
     n_scales = len(head.strides)
+    # 每个 scale 的输出数：keypoints>0 时 4 个（reg/obj/cls/lmk），否则 3 个
+    n_out = 4 if head.keypoints > 0 else 3
     outputs_per_scale = []
     x_shifts = []
     y_shifts = []
@@ -272,15 +297,15 @@ def compute_qat_loss(head, raw_outputs, imgs, targets, seg_targets=None):
     origin_preds = []
 
     for k in range(n_scales):
-        reg_output = raw_outputs[k * 4]
-        obj_output = raw_outputs[k * 4 + 1]
-        cls_output = raw_outputs[k * 4 + 2]
-        lmk_output = raw_outputs[k * 4 + 3]
+        reg_output = raw_outputs[k * n_out]
+        obj_output = raw_outputs[k * n_out + 1]
+        cls_output = raw_outputs[k * n_out + 2]
 
         stride = head.strides[k]
 
         # Same as training branch: cat and decode
         if head.keypoints > 0:
+            lmk_output = raw_outputs[k * n_out + 3]
             output = torch.cat([reg_output, obj_output, cls_output, lmk_output], 1)
         elif head.segcls > 0:
             output = torch.cat([reg_output, obj_output, cls_output], 1)

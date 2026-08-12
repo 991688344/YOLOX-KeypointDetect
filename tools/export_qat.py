@@ -50,6 +50,12 @@ def make_parser():
     parser.add_argument("--opset", default=19, type=int)
     parser.add_argument("--backend", default="qnnpack", type=str,
                         choices=["qnnpack", "fbgemm"])
+    parser.add_argument("--qat-weight-quant", dest="qat_weight_quant",
+                        default="per_channel", type=str,
+                        choices=["per_channel", "per_tensor"],
+                        help="Weight quantization granularity. Must MATCH the "
+                             "setting used during training. 'per_tensor' for "
+                             "opset-12 (RV1126) export.")
     parser.add_argument("--no-onnxsim", action="store_true", default=True)
     parser.add_argument("--onnxsim", action="store_true", default=False,
                         help="Enable onnxsim (may break QDQ nodes)")
@@ -88,7 +94,8 @@ def main():
 
     # Prepare QAT model (insert fake-quant)
     model.eval()
-    prepared = prepare_qat_model(model, exp, backend=args.backend)
+    prepared = prepare_qat_model(model, exp, backend=args.backend,
+                                 weight_quant=args.qat_weight_quant)
 
     # If the ckpt is a QAT-trained checkpoint (has fake-quant keys),
     # load them into the prepared model

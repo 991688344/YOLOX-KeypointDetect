@@ -149,7 +149,7 @@ class COCODataset(Dataset):
 
             NUM_THREADs = min(8, os.cpu_count())
             loaded_images = ThreadPool(NUM_THREADs).imap(
-                lambda x: self.load_resized_img(x),
+                lambda x: self.load_resized_img(x, None),
                 range(len(self.annotations)),
             )
             pbar = tqdm(enumerate(loaded_images), total=len(self.annotations))

@@ -23,7 +23,7 @@ from torch import nn
 
 from yolox.exp import get_exp
 from yolox.models.network_blocks import SiLU
-from yolox.utils import replace_module
+from yolox.utils import replace_module, load_ckpt
 
 
 def make_parser():
@@ -67,7 +67,10 @@ def main():
     model.eval()
     if "model" in ckpt:
         ckpt = ckpt["model"]
-    model.load_state_dict(ckpt)
+    # Filtered load: handles both normal ckpts and QAT GraphModule ckpts
+    # (QAT ckpt keys include fake_quant/observer buffers that don't exist in
+    # the base YOLOX model; strict=False via load_ckpt skips them).
+    model = load_ckpt(model, ckpt)
     model = replace_module(model, nn.SiLU, SiLU)
     model.head.decode_in_inference = args.decode_in_inference
     model.head.model_export = True

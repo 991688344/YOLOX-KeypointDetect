@@ -6,8 +6,6 @@ import argparse, os
 import random
 import warnings
 from loguru import logger
-import os
-os.environ['CUDA_VISIBLE_DEVICES']='2'
 
 import sys
 # 获取当前文件所在目录的绝对路径
@@ -21,6 +19,7 @@ print("grandparent_dir:", grandparent_dir)
 sys.path.append(grandparent_dir)
 import torch
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
 
 from yolox.core import launch
 from yolox.exp import Exp, get_exp
@@ -108,12 +107,31 @@ def make_parser():
              "Mutually exclusive with --fp16 (AMP disabled under QAT).",
     )
     parser.add_argument(
+        "--qat-weight-quant",
+        dest="qat_weight_quant",
+        default="per_channel",
+        type=str,
+        choices=["per_channel", "per_tensor"],
+        help="(QAT only) Weight quantization granularity. "
+             "'per_channel' (default) gives better accuracy, needs opset>=13. "
+             "'per_tensor' is opset-12 compatible (RV1126) but lower precision.",
+    )
+    parser.add_argument(
         "--no-eval",
         dest="no_eval",
         default=False,
         action="store_true",
         help="Disable COCO evaluation during training (much faster; "
              "best_ckpt will not be tracked by AP).",
+    )
+    parser.add_argument(
+        "--no-keypoints",
+        dest="no_keypoints",
+        default=False,
+        action="store_true",
+        help="Disable keypoint training/evaluation entirely (bbox-only mode). "
+             "Removes kp head branches, kp loss, kp augmentation and the slow "
+             "keypoint COCO evaluation. Cannot resume from a keypoint checkpoint.",
     )
     parser.add_argument(
         "opts",
@@ -132,6 +150,20 @@ def main(exp: Exp, args):
             "forced off. Training will run in fp32."
         )
         args.fp16 = False
+
+    if args.no_keypoints:
+        exp.keypoints = 0
+        logger.info(
+            "--no-keypoints: bbox-only mode (exp.keypoints = 0); kp head/loss/"
+            "augmentation/evaluation branches are disabled."
+        )
+
+    if args.qat and dist.is_initialized() and dist.get_world_size() > 1:
+        raise ValueError(
+            "QAT + multi-GPU is not supported: FX GraphModule + DDP is fragile, "
+            "and fake-quant observer scale/zero_point buffers are not all-reduced "
+            "across ranks (quantization params would diverge). Run QAT single-GPU (-d 1)."
+        )
 
     if exp.seed is not None:
         random.seed(exp.seed)

@@ -185,9 +185,10 @@ class Trainer:
             # Keep the original YOLOXHead (with strides/get_output_and_grid/get_losses)
             # for eager loss computation. The GraphModule's .head loses these methods.
             self.qat_head = model.head
-            model = prepare_qat_model(model, self.exp, backend='qnnpack')
+            wq = getattr(self.args, 'qat_weight_quant', 'per_channel')
+            model = prepare_qat_model(model, self.exp, backend='qnnpack', weight_quant=wq)
             model.to(self.device)
-            logger.info("QAT model prepared, fake-quant active.")
+            logger.info("QAT model prepared, fake-quant active (weight_quant={}).".format(wq))
 
         # solver related init
         self.optimizer = self.exp.get_optimizer(self.args.batch_size)
@@ -309,7 +310,7 @@ class Trainer:
             self.train_loader.close_mosaic()
             logger.info("--->Add additional L1 loss now!")
             self.head_module.use_l1 = True
-            self.exp.eval_interval = 1
+            self.exp.eval_interval = getattr(self.exp, "no_aug_eval_interval", 1)
             if not self.no_aug:
                 self.save_ckpt(ckpt_name="last_mosaic_epoch")
         ### 切换到微调 ###
@@ -408,10 +409,52 @@ class Trainer:
             model_state_dict = model.state_dict()
             pretrained_model_dict = ckpt["model"]
             # 过滤模型参数（保留名称和形状均匹配的参数）
-            filtered_model_dict = {
-                k: v for k, v in pretrained_model_dict.items()
-                if k in model_state_dict and v.shape == model_state_dict[k].shape
-            }
+            missing_keys = []          # 键在 pretrained 中但模型没有
+            shape_mismatch_keys = []   # 键存在但形状不一致
+            filtered_model_dict = {}
+
+            for k, v in pretrained_model_dict.items():
+                if k not in model_state_dict:
+                    missing_keys.append(k)
+                elif v.shape != model_state_dict[k].shape:
+                    shape_mismatch_keys.append(k)
+                else:
+                    filtered_model_dict[k] = v
+
+            # 输出日志警告
+            if missing_keys:
+                logger.warning(f"Checkpoint contains keys not present in model: {missing_keys}")
+            if shape_mismatch_keys:
+                logger.warning(f"Keys with shape mismatch between checkpoint and model: {shape_mismatch_keys}")
+
+            # 可选：输出成功加载的参数数量
+            logger.info(f"Successfully loaded {len(filtered_model_dict)} parameters from checkpoint.")
+
+            # for key_model, v in pretrained_model_dict.items():
+            #     ckpt_key = key_model
+            #     if ckpt_key not in ckpt:
+            #         # QAT GraphModule ckpts unfold BaseConv, so BN keys gain an
+            #         # extra '.conv' segment: head.stems.0.bn.* -> head.stems.0.conv.bn.*
+            #         # alt_key = key_model.replace('.bn.', '.conv.bn.')
+            #         if alt_key in ckpt and ckpt[alt_key].shape == v.shape:
+            #             ckpt_key = alt_key
+            #         else:
+            #             logger.warning(
+            #                 "{} is not in the ckpt. Please double check and see if this is desired.".format(
+            #                     key_model
+            #                 )
+            #             )
+            #             continue
+            #     v_ckpt = ckpt[ckpt_key]
+            #     if v.shape != v_ckpt.shape:
+            #         logger.warning(
+            #             "Shape of {} in checkpoint is {}, while shape of {} in model is {}.".format(
+            #                 key_model, v_ckpt.shape, key_model, v.shape
+            #             )
+            #         )
+            #         continue
+            #     filtered_model_dict[key_model] = v_ckpt
+
             # 加载过滤后的模型参数
             model.load_state_dict(filtered_model_dict, strict=False)
             logger.info("Loaded model weights (unmatched parameters skipped)")
