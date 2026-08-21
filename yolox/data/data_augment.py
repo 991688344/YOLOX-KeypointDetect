@@ -302,12 +302,28 @@ def preproc(img, input_size, seg_target, swap=(2, 0, 1)):
 
 
 class TrainTransform:
-    def __init__(self, max_labels=50, flip_prob=0.5, hsv_prob=1.0, keypoints=0, segcls=0):
+    def __init__(self, max_labels=50, flip_prob=0.5, hsv_prob=1.0, keypoints=0, segcls=0,
+                 noise_gauss_prob=0.0, noise_gauss_sigma=4.0,
+                 noise_sp_prob=0.0, noise_sp_p=0.004):
         self.max_labels = max_labels
         self.flip_prob = flip_prob
         self.hsv_prob = hsv_prob
         self.keypoints = keypoints
         self.segcls = segcls
+        # 温和噪声增强（默认关闭，由 exp 配置开启）。
+        # 高斯/椒盐各按独立概率触发，参数与 eye 分类项目一致，不含仿射。
+        self.noise_gauss_prob = noise_gauss_prob
+        self.noise_gauss_sigma = noise_gauss_sigma
+        self.noise_sp_prob = noise_sp_prob
+        self.noise_sp_p = noise_sp_p
+
+    def _maybe_add_noise(self, img):
+        """对最终进网络的 [0,255] float32 CHW 图像加温和噪声（高斯/椒盐）。"""
+        if self.noise_gauss_prob > 0 and random.random() < self.noise_gauss_prob:
+            img = add_gaussian_noise(img, self.noise_gauss_sigma)
+        if self.noise_sp_prob > 0 and random.random() < self.noise_sp_prob:
+            img = add_salt_pepper(img, self.noise_sp_p)
+        return img
 
     def __call__(self, image, targets, input_dim, seg_targets):
         boxes = targets[:, :4].copy()  # xyxy格式
@@ -325,6 +341,7 @@ class TrainTransform:
             else:
                 seg_targets = np.array([])
             image, seg_targets, r_o, dx_o, dy_o = preproc(image, input_dim, seg_targets)
+            image = self._maybe_add_noise(image)
             return image, targets, seg_targets
 
         # 保存原始图像和标签（用于回退）
@@ -417,7 +434,9 @@ class TrainTransform:
         valid_len = min(len(targets_t), self.max_labels)
         padded_labels[:valid_len] = targets_t[:valid_len]
         padded_labels = np.ascontiguousarray(padded_labels, dtype=np.float32)
-        
+
+        image_t = self._maybe_add_noise(image_t)
+
         return image_t, padded_labels, seg_t
 
 

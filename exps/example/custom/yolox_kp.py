@@ -74,6 +74,11 @@ class Exp(MyExp):
         self.shear = 2.0
         self.perspective = 1
         self.enable_mixup = False
+        # --------------- 噪声增强（温和，与 eye 分类项目一致，不含仿射） --------------- #
+        self.noise_gauss_prob = 0.5    # 高斯噪声触发概率（0 关闭）
+        self.noise_gauss_sigma = 7.0   # 高斯噪声 std（[0,255] 域）
+        self.noise_sp_prob = 0.3       # 椒盐噪声触发概率（0 关闭）
+        self.noise_sp_p = 0.004        # 椒盐噪声污染像素比例
 
         # --------------  training config --------------------- #
         self.warmup_epochs = 10
@@ -151,10 +156,24 @@ class Exp(MyExp):
         self.model.train()
         return self.model
 
+    def _train_transform(self, max_labels):
+        """统一的训练预处理构造器，集中配置噪声增强参数（高斯/椒盐，不含仿射）。"""
+        from yolox.data import TrainTransform
+        return TrainTransform(
+            max_labels=max_labels,
+            flip_prob=self.flip_prob,
+            hsv_prob=self.hsv_prob,
+            keypoints=self.keypoints,
+            segcls=self.segcls,
+            noise_gauss_prob=self.noise_gauss_prob,
+            noise_gauss_sigma=self.noise_gauss_sigma,
+            noise_sp_prob=self.noise_sp_prob,
+            noise_sp_p=self.noise_sp_p,
+        )
+
     def get_data_loader(self, batch_size, is_distributed, no_aug=False, cache_img=False):
         from yolox.data import (
             COCODataset,
-            TrainTransform,
             YoloBatchSampler,
             DataLoader,
             InfiniteSampler,
@@ -171,12 +190,7 @@ class Exp(MyExp):
                 keypoints=self.keypoints,
                 segcls=self.segcls,
                 random_dataset=self.random_dataset,
-                preproc=TrainTransform(
-                    max_labels=50,
-                    flip_prob=self.flip_prob,
-                    hsv_prob=self.hsv_prob,
-                    keypoints=self.keypoints,
-                    segcls=self.segcls),
+                preproc=self._train_transform(50),
                 cache=cache_img,
             )
 
@@ -186,12 +200,7 @@ class Exp(MyExp):
             img_size=self.input_size,
             keypoints=self.keypoints,
             segcls=self.segcls,
-            preproc=TrainTransform(
-                max_labels=120,
-                flip_prob=self.flip_prob,
-                hsv_prob=self.hsv_prob,
-                keypoints=self.keypoints,
-                segcls=self.segcls),
+            preproc=self._train_transform(120),
             degrees=self.degrees,  # 旋转角度 10
             translate=self.translate,  # 平移 0.1
             mosaic_scale=self.mosaic_scale,  # 尺度 (0.1, 2)
@@ -236,7 +245,6 @@ class Exp(MyExp):
     def get_data_loader_finetuning(self, batch_size, is_distributed, no_aug=False, cache_img=False):
         from yolox.data import (
             COCODataset,
-            TrainTransform,
             YoloBatchSampler,
             DataLoader,
             InfiniteSampler,
@@ -253,12 +261,7 @@ class Exp(MyExp):
                 keypoints=self.keypoints,
                 segcls=self.segcls,
                 random_dataset=self.random_dataset,
-                preproc=TrainTransform(
-                    max_labels=50,
-                    flip_prob=self.flip_prob,
-                    hsv_prob=self.hsv_prob,
-                    keypoints=self.keypoints,
-                    segcls=self.segcls),
+                preproc=self._train_transform(50),
                 cache=cache_img,
             )
 
@@ -268,12 +271,7 @@ class Exp(MyExp):
             img_size=self.input_size,
             keypoints=self.keypoints,
             segcls=self.segcls,
-            preproc=TrainTransform(
-                max_labels=120,
-                flip_prob=self.flip_prob,
-                hsv_prob=self.hsv_prob,
-                keypoints=self.keypoints,
-                segcls=self.segcls),
+            preproc=self._train_transform(120),
             degrees=self.degrees,  # 旋转角度 10
             translate=self.translate,  # 平移 0.1
             mosaic_scale=self.mosaic_scale,  # 尺度 (0.1, 2)
